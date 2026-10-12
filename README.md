@@ -48,7 +48,7 @@ The RFC has the full motivation, the rules and prior art in other languages.
 
 ## Per-scope state (prototype)
 
-The RFC outlines an internal API with two layers, so that extensions can give implicit state one
+A follow-up to the RFC plans an internal API with two layers, so that extensions can give implicit state one
 copy per scope without changing anything for code outside scopes. This extension implements both,
 each with one user that is off by default.
 
