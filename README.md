@@ -46,6 +46,24 @@ Scope::getCurrent();              // null
 
 The RFC has the full motivation, the rules and prior art in other languages.
 
+## Per-scope state (prototype)
+
+The RFC outlines an internal API that lets an extension give a piece of its globals one copy per
+scope: the globals always hold the current scope's copy, and are swapped when execution moves
+between scopes. Outside any scope they hold what they hold today, and code that reads them directly
+keeps working.
+
+This extension implements that mechanism, with one user, off by default:
+
+```ini
+scope.isolate_json_errors = 1
+```
+
+With it, `json_last_error()` and `json_last_error_msg()` are per scope: a new scope starts with no
+error, the fibers of one scope share it, and requests no longer see each other's last error. Code
+outside any scope sees the global, as without the extension. Swapping it costs roughly 25–55 ns per
+switch between fibers of different scopes; switches within one scope cost a pointer comparison.
+
 ## Build
 
 ```sh

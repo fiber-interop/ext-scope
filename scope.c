@@ -31,6 +31,7 @@
 #include "zend_generators.h"
 #include "zend_observer.h"
 #include "zend_weakrefs.h"
+#include "ext/json/php_json.h"
 #include "scope_arginfo.h"
 
 #define PHP_SCOPE_VERSION "0.1.0"
@@ -39,7 +40,47 @@
 #define SCOPE_CURRENT 1
 #define SCOPE_SAVED   2
 
+/* ---- per-scope state: the internal API outlined in the RFC ----------------
+ *
+ * A piece of some module's globals that gets one copy per scope. The globals
+ * always hold the copy of the scope that is current; when the current scope
+ * changes, the engine saves the old scope's copy and loads the new one's. Outside
+ * any scope the globals hold what they hold without this extension. */
+typedef struct {
+	void *live;                  /* the state in the module's globals */
+	size_t size;
+	void (*init)(void *state);   /* the state of a new scope */
+	void (*destroy)(void *state);
+} scope_state;
+
+#define SCOPE_MAX_STATES 16
+static scope_state scope_states[SCOPE_MAX_STATES];
+static size_t scope_state_offset[SCOPE_MAX_STATES];
+static size_t scope_states_n, scope_states_size;
+
+static int scope_register_state(const scope_state *state)
+{
+	if (scope_states_n == SCOPE_MAX_STATES) {
+		return FAILURE;
+	}
+	scope_state_offset[scope_states_n] = scope_states_size;
+	scope_states[scope_states_n++] = *state;
+	scope_states_size += ZEND_MM_ALIGNED_SIZE(state->size);
+	return SUCCESS;
+}
+
+/* A Scope object, with its copy of the registered state (allocated on first use). */
+typedef struct {
+	char *state;
+	zend_object std;
+} scope_object;
+
+#define SCOPE_OBJECT(obj) ((scope_object *) ((char *) (obj) - XtOffsetOf(scope_object, std)))
+
 ZEND_BEGIN_MODULE_GLOBALS(scope)
+	bool isolate_json_errors;   /* INI scope.isolate_json_errors */
+	zend_object *applied;   /* the scope whose state is in the globals; NULL: none */
+	char *root_state;       /* the globals' own state while a scope's is applied */
 	bool active;            /* between RINIT and RSHUTDOWN */
 	zval main;              /* {main}'s array */
 	zend_array *cur;        /* the array of the code running now */
@@ -125,6 +166,46 @@ static zend_object *scope_generator_create(zend_class_entry *ce)
 	return obj;
 }
 
+/* Make the globals hold the state of the scope that is current now. Called
+ * wherever the current scope can change. */
+static void scope_apply(void)
+{
+	zend_object *want = NULL;
+	char *save, *load;
+	zval *current;
+
+	if (scope_states_n == 0 || SCOPE_G(cur) == NULL) {
+		return;
+	}
+	current = scope_current(SCOPE_G(cur));
+	if (Z_TYPE_P(current) == IS_OBJECT) {
+		want = Z_OBJ_P(current);
+	}
+	if (want == SCOPE_G(applied)) {
+		return;
+	}
+	save = SCOPE_G(applied) ? SCOPE_OBJECT(SCOPE_G(applied))->state : SCOPE_G(root_state);
+	for (size_t i = 0; i < scope_states_n; i++) {
+		memcpy(save + scope_state_offset[i], scope_states[i].live, scope_states[i].size);
+	}
+	if (want) {
+		scope_object *so = SCOPE_OBJECT(want);
+		if (so->state == NULL) {
+			so->state = emalloc(scope_states_size);
+			for (size_t i = 0; i < scope_states_n; i++) {
+				scope_states[i].init(so->state + scope_state_offset[i]);
+			}
+		}
+		load = so->state;
+	} else {
+		load = SCOPE_G(root_state);
+	}
+	for (size_t i = 0; i < scope_states_n; i++) {
+		memcpy(scope_states[i].live, load + scope_state_offset[i], scope_states[i].size);
+	}
+	SCOPE_G(applied) = want;
+}
+
 /* ---- fibers: switch the running array with the running context ------------ */
 
 static void scope_fiber_init(zend_fiber_context *ctx)
@@ -157,6 +238,7 @@ static void scope_fiber_switch(zend_fiber_context *from, zend_fiber_context *to)
 	zend_hash_index_update_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(from), SCOPE_G(cur));
 	a = zend_hash_index_find_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(to));
 	SCOPE_G(cur) = a ? a : Z_ARR(SCOPE_G(main));
+	scope_apply();
 }
 
 static void scope_fiber_destroy(zend_fiber_context *ctx)
@@ -181,6 +263,7 @@ static void scope_generator_begin(zend_execute_data *execute_data)
 	}
 	zend_hash_index_update_ptr(&SCOPE_G(gen_prev), SCOPE_KEY(g), SCOPE_G(cur));
 	SCOPE_G(cur) = a;
+	scope_apply();
 }
 
 static void scope_generator_end(zend_execute_data *execute_data, zval *retval)
@@ -194,6 +277,7 @@ static void scope_generator_end(zend_execute_data *execute_data, zval *retval)
 	if ((prev = zend_hash_index_find_ptr(&SCOPE_G(gen_prev), SCOPE_KEY(g))) != NULL) {
 		SCOPE_G(cur) = prev;
 		zend_hash_index_del(&SCOPE_G(gen_prev), SCOPE_KEY(g));
+		scope_apply();
 	}
 }
 
@@ -209,9 +293,25 @@ static zend_observer_fcall_handlers scope_observer_init(zend_execute_data *execu
 
 static zend_object *scope_create(zend_class_entry *ce)
 {
-	zend_object *obj = zend_objects_new(ce);
-	obj->handlers = &scope_handlers;
-	return obj;
+	scope_object *so = zend_object_alloc(sizeof(scope_object), ce);
+	zend_object_std_init(&so->std, ce);
+	object_properties_init(&so->std, ce);
+	so->std.handlers = &scope_handlers;
+	return &so->std;
+}
+
+static void scope_free(zend_object *obj)
+{
+	scope_object *so = SCOPE_OBJECT(obj);
+	if (so->state) {
+		for (size_t i = 0; i < scope_states_n; i++) {
+			if (scope_states[i].destroy) {
+				scope_states[i].destroy(so->state + scope_state_offset[i]);
+			}
+		}
+		efree(so->state);
+	}
+	zend_object_std_dtor(obj);
 }
 
 ZEND_METHOD(Scope, __construct)
@@ -244,6 +344,7 @@ ZEND_METHOD(Scope, run)
 	ZVAL_COPY_VALUE(&saved, current);
 	zend_hash_next_index_insert_new(a, &saved);
 	ZVAL_OBJ_COPY(scope_current(a), Z_OBJ_P(ZEND_THIS));
+	scope_apply();
 
 	fci.retval = return_value;
 	zend_try {
@@ -263,6 +364,7 @@ ZEND_METHOD(Scope, run)
 		zend_hash_index_del(a, top);
 		a->nNextFreeElement = top;
 	}
+	scope_apply();
 
 	if (bailout) {
 		zend_bailout();
@@ -322,7 +424,35 @@ static const zend_function_entry scope_generator_methods[] = {
 	ZEND_FE_END
 };
 
+/* ---- the first user: json_last_error() per scope (INI scope.isolate_json_errors) */
+
+static void scope_json_init(void *state)
+{
+	*(php_json_error_code *) state = PHP_JSON_ERROR_NONE;
+}
+
+static void scope_register_json(void)
+{
+	zend_module_entry *json = zend_hash_str_find_ptr(&module_registry, ZEND_STRL("json"));
+	scope_state state = { NULL, sizeof(php_json_error_code), scope_json_init, NULL };
+
+	if (json == NULL || json->globals_size != sizeof(zend_json_globals)) {
+		return;
+	}
+#ifdef ZTS
+	return;   /* the prototype keeps to NTS builds */
+#else
+	state.live = &((zend_json_globals *) json->globals_ptr)->error_code;
+	scope_register_state(&state);
+#endif
+}
+
 /* ---- module -------------------------------------------------------------- */
+
+PHP_INI_BEGIN()
+	STD_PHP_INI_BOOLEAN("scope.isolate_json_errors", "0", PHP_INI_SYSTEM, OnUpdateBool,
+		isolate_json_errors, zend_scope_globals, scope_globals)
+PHP_INI_END()
 
 static PHP_GINIT_FUNCTION(scope)
 {
@@ -334,8 +464,11 @@ static PHP_GINIT_FUNCTION(scope)
 
 static PHP_MINIT_FUNCTION(scope)
 {
+	REGISTER_INI_ENTRIES();
 	scope_ce = register_class_Scope();
 	memcpy(&scope_handlers, &std_object_handlers, sizeof(zend_object_handlers));
+	scope_handlers.offset = XtOffsetOf(scope_object, std);
+	scope_handlers.free_obj = scope_free;
 	scope_handlers.clone_obj = NULL;   /* a scope is an identity: a copy would be another scope */
 	scope_ce->create_object = scope_create;
 	scope_weakmap_ce = zend_hash_str_find_ptr(CG(class_table), ZEND_STRL("weakmap"));
@@ -355,6 +488,9 @@ static PHP_MINIT_FUNCTION(scope)
 	zend_observer_fiber_switch_register(scope_fiber_switch);
 	zend_observer_fiber_destroy_register(scope_fiber_destroy);
 	zend_observer_fcall_register(scope_observer_init);
+	if (SCOPE_G(isolate_json_errors)) {
+		scope_register_json();
+	}
 	return SUCCESS;
 }
 
@@ -362,6 +498,7 @@ static PHP_MSHUTDOWN_FUNCTION(scope)
 {
 	zend_ce_fiber->create_object = scope_fiber_create_orig;
 	zend_ce_generator->create_object = scope_generator_create_orig;
+	UNREGISTER_INI_ENTRIES();
 	return SUCCESS;
 }
 
@@ -379,6 +516,8 @@ static PHP_RINIT_FUNCTION(scope)
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(gen_prev), 16, NULL, NULL, 0);
+	SCOPE_G(applied) = NULL;
+	SCOPE_G(root_state) = scope_states_size ? ecalloc(1, scope_states_size) : NULL;
 	SCOPE_G(active) = true;
 	return SUCCESS;
 }
@@ -387,6 +526,14 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 {
 	/* Fibers and generators can outlive this point (objects are freed later in
 	 * shutdown); from here on they simply have no scope. */
+	SCOPE_G(cur) = Z_ARR(SCOPE_G(main));   /* {main}, outside any scope: the globals' own state */
+	zval_ptr_dtor(scope_current(SCOPE_G(cur)));
+	ZVAL_NULL(scope_current(SCOPE_G(cur)));
+	scope_apply();
+	if (SCOPE_G(root_state)) {
+		efree(SCOPE_G(root_state));
+		SCOPE_G(root_state) = NULL;
+	}
 	SCOPE_G(active) = false;
 	SCOPE_G(cur) = NULL;
 	zend_hash_destroy(&SCOPE_G(gen_prev));
@@ -403,6 +550,7 @@ static PHP_MINFO_FUNCTION(scope)
 	php_info_print_table_row(2, "Scope support", "enabled");
 	php_info_print_table_row(2, "Version", PHP_SCOPE_VERSION);
 	php_info_print_table_end();
+	DISPLAY_INI_ENTRIES();
 }
 
 zend_module_entry scope_module_entry = {
