@@ -48,12 +48,23 @@ The RFC has the full motivation, the rules and prior art in other languages.
 
 ## Per-scope state (prototype)
 
-The RFC outlines an internal API that lets an extension give a piece of its globals one copy per
-scope: the globals always hold the current scope's copy, and are swapped when execution moves
-between scopes. Outside any scope they hold what they hold today, and code that reads them directly
-keeps working.
+The RFC outlines an internal API with two layers, so that extensions can give implicit state one
+copy per scope without changing anything for code outside scopes. This extension implements both,
+each with one user that is off by default.
 
-This extension implements that mechanism, with one user, off by default:
+**Slots** are for new code: an extension allocates a slot at startup, and `scope_slot()` returns
+the current scope's copy of its state, created on first use. Outside any scope it returns the copy
+of an implicit root scope, so extension code never handles a missing scope; the root scope is
+internal, and `Scope::getCurrent()` still returns `null` there. A change of scope updates a
+pointer. The demonstration user is a per-scope counter:
+
+```ini
+scope.slot_demo = 1    ; adds scope_demo_counter(): int
+```
+
+**Swapped globals** are a bridge for state that stays in an extension's globals: the globals always
+hold the current scope's copy, and are swapped when execution moves between scopes, so code that
+reads them directly keeps working. The demonstration user is `json_last_error()`:
 
 ```ini
 scope.isolate_json_errors = 1
@@ -61,7 +72,7 @@ scope.isolate_json_errors = 1
 
 With it, `json_last_error()` and `json_last_error_msg()` are per scope: a new scope starts with no
 error, the fibers of one scope share it, and requests no longer see each other's last error. Code
-outside any scope sees the global, as without the extension. Swapping it costs roughly 25–55 ns per
+outside any scope sees the global, as without the extension. Swapping costs roughly 25–55 ns per
 switch between fibers of different scopes; switches within one scope cost a pointer comparison.
 
 ## Build

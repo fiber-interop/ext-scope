@@ -69,9 +69,47 @@ static int scope_register_state(const scope_state *state)
 	return SUCCESS;
 }
 
-/* A Scope object, with its copy of the registered state (allocated on first use). */
+/* Per-scope slots: state reached through scope_slot(), which returns the current
+ * scope's copy, or the copy of an implicit root scope outside any scope. */
+typedef struct {
+	size_t size;
+	void (*init)(void *state);
+	void (*destroy)(void *state);
+} scope_slot_type;
+
+#define SCOPE_MAX_SLOTS 16
+static scope_slot_type scope_slot_types[SCOPE_MAX_SLOTS];
+static int scope_slots_n;
+
+static int scope_slot_allocate(size_t size, void (*init)(void *), void (*destroy)(void *))
+{
+	if (scope_slots_n == SCOPE_MAX_SLOTS) {
+		return -1;
+	}
+	scope_slot_types[scope_slots_n] = (scope_slot_type) { size, init, destroy };
+	return scope_slots_n++;
+}
+
+static void scope_slots_free(void **slots)
+{
+	if (slots == NULL) {
+		return;
+	}
+	for (int i = 0; i < scope_slots_n; i++) {
+		if (slots[i]) {
+			if (scope_slot_types[i].destroy) {
+				scope_slot_types[i].destroy(slots[i]);
+			}
+			efree(slots[i]);
+		}
+	}
+	efree(slots);
+}
+
+/* A Scope object, with its swapped globals and its slots (both allocated on first use). */
 typedef struct {
 	char *state;
+	void **slots;
 	zend_object std;
 } scope_object;
 
@@ -80,6 +118,9 @@ typedef struct {
 ZEND_BEGIN_MODULE_GLOBALS(scope)
 	bool isolate_json_errors;   /* INI scope.isolate_json_errors */
 	zend_object *applied;   /* the scope whose state is in the globals; NULL: none */
+	zend_object *cur_scope; /* the current scope, NULL outside any (kept by scope_apply()) */
+	void **root_slots;      /* the implicit root scope's slots */
+	bool slot_demo;         /* INI scope.slot_demo */
 	char *root_state;       /* the globals' own state while a scope's is applied */
 	bool active;            /* between RINIT and RSHUTDOWN */
 	zval main;              /* {main}'s array */
@@ -174,14 +215,15 @@ static void scope_apply(void)
 	char *save, *load;
 	zval *current;
 
-	if (scope_states_n == 0 || SCOPE_G(cur) == NULL) {
+	if (SCOPE_G(cur) == NULL) {
 		return;
 	}
 	current = scope_current(SCOPE_G(cur));
 	if (Z_TYPE_P(current) == IS_OBJECT) {
 		want = Z_OBJ_P(current);
 	}
-	if (want == SCOPE_G(applied)) {
+	SCOPE_G(cur_scope) = want;
+	if (scope_states_n == 0 || want == SCOPE_G(applied)) {
 		return;
 	}
 	save = SCOPE_G(applied) ? SCOPE_OBJECT(SCOPE_G(applied))->state : SCOPE_G(root_state);
@@ -204,6 +246,21 @@ static void scope_apply(void)
 		memcpy(scope_states[i].live, load + scope_state_offset[i], scope_states[i].size);
 	}
 	SCOPE_G(applied) = want;
+}
+
+/* The current scope's copy of a slot; the root scope's outside any scope. */
+static void *scope_slot(int slot)
+{
+	void ***slotsp = SCOPE_G(cur_scope) ? &SCOPE_OBJECT(SCOPE_G(cur_scope))->slots : &SCOPE_G(root_slots);
+
+	if (*slotsp == NULL) {
+		*slotsp = ecalloc(scope_slots_n, sizeof(void *));
+	}
+	if ((*slotsp)[slot] == NULL) {
+		(*slotsp)[slot] = emalloc(scope_slot_types[slot].size);
+		scope_slot_types[slot].init((*slotsp)[slot]);
+	}
+	return (*slotsp)[slot];
 }
 
 /* ---- fibers: switch the running array with the running context ------------ */
@@ -303,6 +360,7 @@ static zend_object *scope_create(zend_class_entry *ce)
 static void scope_free(zend_object *obj)
 {
 	scope_object *so = SCOPE_OBJECT(obj);
+	scope_slots_free(so->slots);
 	if (so->state) {
 		for (size_t i = 0; i < scope_states_n; i++) {
 			if (scope_states[i].destroy) {
@@ -447,11 +505,41 @@ static void scope_register_json(void)
 #endif
 }
 
+/* ---- a demonstration slot user (INI scope.slot_demo): a per-scope counter ---- */
+
+static int scope_demo_slot = -1;
+
+static void scope_demo_init(void *state)
+{
+	*(zend_long *) state = 0;
+}
+
+/* scope_demo_counter(): int, the current scope's counter, incremented. */
+static ZEND_NAMED_FUNCTION(scope_demo_counter)
+{
+	ZEND_PARSE_PARAMETERS_NONE();
+	RETURN_LONG(++*(zend_long *) scope_slot(scope_demo_slot));
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_scope_demo_counter, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+static const zend_function_entry scope_demo_functions[] = {
+#if PHP_VERSION_ID >= 80400
+	ZEND_RAW_FENTRY("scope_demo_counter", scope_demo_counter, arginfo_scope_demo_counter, 0, NULL, NULL)
+#else
+	ZEND_RAW_FENTRY("scope_demo_counter", scope_demo_counter, arginfo_scope_demo_counter, 0)
+#endif
+	ZEND_FE_END
+};
+
 /* ---- module -------------------------------------------------------------- */
 
 PHP_INI_BEGIN()
 	STD_PHP_INI_BOOLEAN("scope.isolate_json_errors", "0", PHP_INI_SYSTEM, OnUpdateBool,
 		isolate_json_errors, zend_scope_globals, scope_globals)
+	STD_PHP_INI_BOOLEAN("scope.slot_demo", "0", PHP_INI_SYSTEM, OnUpdateBool,
+		slot_demo, zend_scope_globals, scope_globals)
 PHP_INI_END()
 
 static PHP_GINIT_FUNCTION(scope)
@@ -491,6 +579,10 @@ static PHP_MINIT_FUNCTION(scope)
 	if (SCOPE_G(isolate_json_errors)) {
 		scope_register_json();
 	}
+	if (SCOPE_G(slot_demo)) {
+		scope_demo_slot = scope_slot_allocate(sizeof(zend_long), scope_demo_init, NULL);
+		zend_register_functions(NULL, scope_demo_functions, NULL, MODULE_PERSISTENT);
+	}
 	return SUCCESS;
 }
 
@@ -517,6 +609,8 @@ static PHP_RINIT_FUNCTION(scope)
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(gen_prev), 16, NULL, NULL, 0);
 	SCOPE_G(applied) = NULL;
+	SCOPE_G(cur_scope) = NULL;
+	SCOPE_G(root_slots) = NULL;
 	SCOPE_G(root_state) = scope_states_size ? ecalloc(1, scope_states_size) : NULL;
 	SCOPE_G(active) = true;
 	return SUCCESS;
@@ -534,6 +628,8 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 		efree(SCOPE_G(root_state));
 		SCOPE_G(root_state) = NULL;
 	}
+	scope_slots_free(SCOPE_G(root_slots));
+	SCOPE_G(root_slots) = NULL;
 	SCOPE_G(active) = false;
 	SCOPE_G(cur) = NULL;
 	zend_hash_destroy(&SCOPE_G(gen_prev));
