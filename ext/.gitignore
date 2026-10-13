@@ -1,0 +1,3 @@
+# Prebuilt binaries, named scope-<major.minor>-<nts|zts>-<arch>-<glibc|musl|darwin>.so,
+# are added to release archives, not to git.
+*.so
