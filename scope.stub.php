@@ -18,6 +18,9 @@ final class Scope
     /** Calls $callback with this scope as the current scope, and returns its result. */
     public function run(callable $callback, mixed ...$args): mixed {}
 
-    /** The current scope, or null outside any scope. */
-    public static function getCurrent(): ?Scope {}
+    /** The current scope; the root scope outside any run(). */
+    public static function getCurrent(): Scope {}
+
+    /** The root scope: one object for the whole request, current in {main} outside any run(). */
+    public static function getRootScope(): Scope {}
 }

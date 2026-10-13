@@ -9,17 +9,21 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_class_Scope_run, 0, 1, IS_MIXED,
 	ZEND_ARG_VARIADIC_TYPE_INFO(0, args, IS_MIXED, 0)
 ZEND_END_ARG_INFO()
 
-ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_class_Scope_getCurrent, 0, 0, Scope, 1)
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_class_Scope_getCurrent, 0, 0, Scope, 0)
 ZEND_END_ARG_INFO()
+
+#define arginfo_class_Scope_getRootScope arginfo_class_Scope_getCurrent
 
 ZEND_METHOD(Scope, __construct);
 ZEND_METHOD(Scope, run);
 ZEND_METHOD(Scope, getCurrent);
+ZEND_METHOD(Scope, getRootScope);
 
 static const zend_function_entry class_Scope_methods[] = {
 	ZEND_ME(Scope, __construct, arginfo_class_Scope___construct, ZEND_ACC_PUBLIC)
 	ZEND_ME(Scope, run, arginfo_class_Scope_run, ZEND_ACC_PUBLIC)
 	ZEND_ME(Scope, getCurrent, arginfo_class_Scope_getCurrent, ZEND_ACC_PUBLIC|ZEND_ACC_STATIC)
+	ZEND_ME(Scope, getRootScope, arginfo_class_Scope_getRootScope, ZEND_ACC_PUBLIC|ZEND_ACC_STATIC)
 	ZEND_FE_END
 };
 

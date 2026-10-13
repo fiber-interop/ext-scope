@@ -53,6 +53,6 @@ consumer still in: B
 Generator::getScope(): A
 first value, consumed from {main}: A
 yield from: A,B,A
-main while the generator is inside run: null
+main while the generator is inside run: root
 generator in fiber yields: A
 closure created in A, called in B: B

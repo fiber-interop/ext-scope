@@ -49,13 +49,13 @@ $f = $a->run(fn() => new Fiber(function () {
 $f->start();
 ?>
 --EXPECT--
-main after start: null
+main after start: root
 fiber: A, after suspend A
 Fiber::getScope(): A
-fiber from {main}: null
-main while fiber is inside run: null
+fiber from {main}: root
+main while fiber is inside run: root
 inside run: A, after suspend A
-fiber after run: null
+fiber after run: root
 in B's run: B
 back in own scope: A
 child belongs to: A

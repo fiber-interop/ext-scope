@@ -11,7 +11,8 @@ final class RequestServices
     private static ?WeakMap $services = null;
     public static function get(string $id): object
     {
-        $scope = Scope::getCurrent() ?? throw new LogicException('Not running inside a request scope');
+        $scope = Scope::getCurrent();
+        if ($scope === Scope::getRootScope()) throw new LogicException('Not running inside a request scope');
         self::$services ??= new WeakMap();
         self::$services[$scope] ??= [];
         return self::$services[$scope][$id] ??= new ArrayObject([$id, current_name()]);
@@ -32,7 +33,7 @@ foreach (['R1', 'R2'] as $r) {
 }
 while ($queue) {
     [$scope, $cb] = array_shift($queue);
-    $scope === null ? $cb() : $scope->run($cb);
+    $scope->run($cb);
 }
 try {
     RequestServices::get('db');

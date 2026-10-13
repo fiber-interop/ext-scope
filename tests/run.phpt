@@ -24,12 +24,12 @@ try { clone $a; } catch (Error $e) { echo get_class($e), ": ", $e->getMessage(),
 try { serialize($a); } catch (Exception $e) { echo get_class($e), ": ", $e->getMessage(), "\n"; }
 ?>
 --EXPECT--
-main: null
+main: root
 run with args: A12
-after: null
+after: root
 nested: B
 back in: A
 same scope again: A
-after exception: null
+after exception: root
 Error: Trying to clone an uncloneable object of class Scope
 Exception: Serialization of 'Scope' is not allowed

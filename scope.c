@@ -123,6 +123,7 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	bool slot_demo;         /* INI scope.slot_demo */
 	char *root_state;       /* the globals' own state while a scope's is applied */
 	bool active;            /* between RINIT and RSHUTDOWN */
+	zend_object *root;      /* Scope::getRootScope(), created on first use; internally the root is NULL */
 	zval main;              /* {main}'s array */
 	zend_array *cur;        /* the array of the code running now */
 	zval members;           /* WeakMap: Fiber|Generator => its array */
@@ -360,6 +361,9 @@ static zend_object *scope_create(zend_class_entry *ce)
 static void scope_free(zend_object *obj)
 {
 	scope_object *so = SCOPE_OBJECT(obj);
+	if (SCOPE_G(root) == obj) {
+		SCOPE_G(root) = NULL;   /* freed by the object store after RSHUTDOWN */
+	}
 	scope_slots_free(so->slots);
 	if (so->state) {
 		for (size_t i = 0; i < scope_states_n; i++) {
@@ -370,6 +374,28 @@ static void scope_free(zend_object *obj)
 		efree(so->state);
 	}
 	zend_object_std_dtor(obj);
+}
+
+/* The root scope object. Inside, the root is NULL in the arrays (and in
+ * cur_scope), so root_slots and root_state stay its state; this object is only
+ * its public face, the same one for the whole request. */
+static zend_object *scope_root(void)
+{
+	if (SCOPE_G(root) == NULL) {
+		zval z;
+		object_init_ex(&z, scope_ce);
+		SCOPE_G(root) = Z_OBJ(z);
+	}
+	return SCOPE_G(root);
+}
+
+/* Return a scope as stored in an array: the object, or the root for NULL. */
+static void scope_return(zval *scope, zval *return_value)
+{
+	if (scope && Z_TYPE_P(scope) == IS_OBJECT) {
+		RETURN_COPY(scope);
+	}
+	RETURN_OBJ_COPY(scope_root());
 }
 
 ZEND_METHOD(Scope, __construct)
@@ -401,7 +427,11 @@ ZEND_METHOD(Scope, run)
 	current = scope_current(a);
 	ZVAL_COPY_VALUE(&saved, current);
 	zend_hash_next_index_insert_new(a, &saved);
-	ZVAL_OBJ_COPY(scope_current(a), Z_OBJ_P(ZEND_THIS));
+	if (Z_OBJ_P(ZEND_THIS) == SCOPE_G(root)) {
+		ZVAL_NULL(scope_current(a));
+	} else {
+		ZVAL_OBJ_COPY(scope_current(a), Z_OBJ_P(ZEND_THIS));
+	}
 	scope_apply();
 
 	fci.retval = return_value;
@@ -433,10 +463,14 @@ ZEND_METHOD(Scope, getCurrent)
 {
 	ZEND_PARSE_PARAMETERS_NONE();
 
-	if (SCOPE_G(cur) == NULL) {
-		RETURN_NULL();
-	}
-	RETURN_COPY(scope_current(SCOPE_G(cur)));
+	scope_return(SCOPE_G(cur) ? scope_current(SCOPE_G(cur)) : NULL, return_value);
+}
+
+ZEND_METHOD(Scope, getRootScope)
+{
+	ZEND_PARSE_PARAMETERS_NONE();
+
+	RETURN_OBJ_COPY(scope_root());
 }
 
 /* ---- Fiber::getScope() and Generator::getScope() --------------------------- */
@@ -447,10 +481,8 @@ static void scope_get_member_scope(INTERNAL_FUNCTION_PARAMETERS)
 
 	ZEND_PARSE_PARAMETERS_NONE();
 
-	if ((a = scope_member_array(Z_OBJ_P(ZEND_THIS))) == NULL) {
-		RETURN_NULL();
-	}
-	RETURN_COPY(zend_hash_index_find(a, SCOPE_MEMBER));
+	a = scope_member_array(Z_OBJ_P(ZEND_THIS));
+	scope_return(a ? zend_hash_index_find(a, SCOPE_MEMBER) : NULL, return_value);
 }
 
 static ZEND_NAMED_FUNCTION(scope_fiber_get_scope)
@@ -463,7 +495,7 @@ static ZEND_NAMED_FUNCTION(scope_generator_get_scope)
 	scope_get_member_scope(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
-ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_scope_get_scope, 0, 0, Scope, 1)
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_scope_get_scope, 0, 0, Scope, 0)
 ZEND_END_ARG_INFO()
 
 #if PHP_VERSION_ID >= 80400
@@ -612,6 +644,7 @@ static PHP_RINIT_FUNCTION(scope)
 	SCOPE_G(cur_scope) = NULL;
 	SCOPE_G(root_slots) = NULL;
 	SCOPE_G(root_state) = scope_states_size ? ecalloc(1, scope_states_size) : NULL;
+	SCOPE_G(root) = NULL;
 	SCOPE_G(active) = true;
 	return SUCCESS;
 }
@@ -637,6 +670,10 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 	zend_hash_destroy(&SCOPE_G(ctx_cur));
 	zval_ptr_dtor(&SCOPE_G(members));
 	zval_ptr_dtor(&SCOPE_G(main));
+	if (SCOPE_G(root)) {
+		OBJ_RELEASE(SCOPE_G(root));   /* scope_free() clears SCOPE_G(root) if this was the last reference */
+		SCOPE_G(root) = NULL;
+	}
 	return SUCCESS;
 }
 
