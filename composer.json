@@ -17,13 +17,7 @@
         "priority": 80,
         "support-zts": true,
         "support-nts": true,
-        "configure-options": [
-            {
-                "name": "enable-scope",
-                "description": "Enable the Scope class",
-                "needs-value": false
-            }
-        ],
+        "configure-options": [],
         "download-url-method": [
             "composer-default"
         ],
