@@ -22,4 +22,8 @@ jobs:
       - name: Build
         run: phpize && ./configure && make -j"$(nproc)"
       - name: make test
-        run: make test NO_INTERACTION=1 REPORT_EXIT_STATUS=1 TESTS="--show-diff tests"
+        run: |
+          make test NO_INTERACTION=1 REPORT_EXIT_STATUS=1 TESTS="--show-diff tests" | tee test.log
+          # A build that fails to load runs zero tests and still reports zero failures.
+          grep -Eq '^Tests passed +: +[1-9]' test.log
+          php -d extension=modules/scope.so -r 'var_dump(Scope::getCurrent() === Scope::getRootScope());' | grep -q 'bool(true)'
