@@ -1,3 +1,5 @@
+/* Hand-edited (getRootScope added, getCurrent non-nullable): gen_stub.php was not available.
+ * The stub hash below is stale; regenerate from scope.stub.php with gen_stub.php. */
 /* This is a generated file, edit the .stub.php file instead.
  * Stub hash: ce6fedc6b9662ec9ddb0ee1c948c0108a3ddf731 */
 

@@ -1,7 +1,7 @@
-# fiber-interop/scope
+# fiber-interop/ext-scope
 
 The `Scope` class from the [PHP RFC: Scope](https://wiki.php.net/rfc/scope), as an extension for
-PHP 8.2 and later, and as a userland polyfill (PHP 8.1+) when the extension is not loaded.
+PHP 8.2 and later. A userland polyfill with the same class is `fiber-interop/scope`.
 
 A `Scope` identifies the logical operation running code belongs to, such as an HTTP request, a
 queued job or a transaction, and keeps that identity across fibers and generators. Service
@@ -43,37 +43,7 @@ from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
 - **PIE**: `pie install fiber-interop/scope`
 - **PECL**: `pecl install scope`
-- **Composer**: `composer require fiber-interop/scope`. Uses the extension when it is loaded,
-  else the polyfill below. On the CLI it can also load a bundled binary from `ext/` for the
-  running PHP build (file `scope-<8.x>-<nts|zts>-<arch>-<glibc|musl|darwin>.so`) by re-executing
-  PHP with `-d extension=…` (needs `pcntl`); opt in with `FIBER_INTEROP_SCOPE_EXT=1` or
-  `"extra": {"fiber-interop/scope": {"ext": true}}` in your root `composer.json`.
-  `FIBER_INTEROP_SCOPE_SO` points at a binary elsewhere.
-
 A project that declares its own global `Scope` class cannot install this package.
-
-## Polyfill
-
-When no `Scope` class exists, the package declares one in userland with the same four methods and
-signatures. It keeps a stack of `run()` scopes per fiber (a `WeakMap` keyed by the fiber) and one
-for `{main}`. `fiber_interop\scope\IS_POLYFILL` is `true` when the polyfill is in use.
-
-It cannot add `Fiber::getScope()` or `Generator::getScope()`, and it has two gaps the extension
-closes (they are the RFC's motivation):
-
-- A fiber created with `new Fiber` by code that doesn't cooperate sees the root scope, not the
-  scope current at its construction. Libraries cooperate by capturing `Scope::getCurrent()` when
-  they create a fiber and calling `$scope->run(...)` inside it, as fiber-interop's `go()` and its
-  adapters do.
-- A generator sees the scope of the code iterating it, not the scope current when it was created.
-
-`getCurrent()` also costs a map lookup instead of a pointer read.
-
-Polyfill rules: it declares nothing if a `Scope` class already exists; it has exactly the
-extension's names and signatures and no extra methods (so new methods go into the RFC and the
-extension first); its major version follows the extension's; it does not `provide` `ext-scope`;
-its gaps are documented here and exposed through the `IS_POLYFILL` constant in the package's own
-namespace, never on the class.
 
 ## Rules
 
@@ -126,8 +96,6 @@ phpize
 ./configure --enable-scope
 make
 make test
-vendor/bin/phpunit                                       # polyfill (after composer install)
-php -d extension=modules/scope.so vendor/bin/phpunit     # same tests, extension
 php -d extension=modules/scope.so your-script.php
 ```
 
