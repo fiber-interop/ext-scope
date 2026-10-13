@@ -1,6 +1,7 @@
-# scope
+# fiber-interop/scope
 
-The `Scope` class from the *PHP RFC: Scope*, as an extension for PHP 8.2 and later.
+The `Scope` class from the [PHP RFC: Scope](https://wiki.php.net/rfc/scope), as an extension for
+PHP 8.2 and later, and as a userland polyfill (PHP 8.1+) when the extension is not loaded.
 
 A `Scope` identifies the logical operation running code belongs to, such as an HTTP request, a
 queued job or a transaction, and keeps that identity across fibers and generators. Service
@@ -12,11 +13,12 @@ final class Scope
 {
     public function __construct() {}
     public function run(callable $callback, mixed ...$args): mixed {}
-    public static function getCurrent(): ?Scope {}
+    public static function getCurrent(): Scope {}
+    public static function getRootScope(): Scope {}
 }
 
-Fiber::getScope(): ?Scope;       // added by this extension
-Generator::getScope(): ?Scope;   // added by this extension
+Fiber::getScope(): Scope;       // added by the extension
+Generator::getScope(): Scope;   // added by the extension
 ```
 
 ```php
@@ -28,8 +30,50 @@ $scope->run(function () {
     });
     $fiber->start();
 });
-Scope::getCurrent();              // null
+Scope::getCurrent();              // Scope::getRootScope()
 ```
+
+The root scope is one object for the whole request (process, on the CLI). It is current in
+`{main}` outside any `run()`, and in fibers and generators created there, so `getCurrent()` and
+`getScope()` never return `null`. "Am I inside an operation" is
+`Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
+from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
+
+## Install
+
+- **PIE**: `pie install fiber-interop/scope`
+- **PECL**: `pecl install scope`
+- **Composer**: `composer require fiber-interop/scope`. Uses the extension when it is loaded,
+  else the polyfill below. On the CLI it can also load a bundled binary from `ext/` for the
+  running PHP build (file `scope-<8.x>-<nts|zts>-<arch>-<glibc|musl|darwin>.so`) by re-executing
+  PHP with `-d extension=…` (needs `pcntl`); opt in with `FIBER_INTEROP_SCOPE_EXT=1` or
+  `"extra": {"fiber-interop/scope": {"ext": true}}` in your root `composer.json`.
+  `FIBER_INTEROP_SCOPE_SO` points at a binary elsewhere.
+
+A project that declares its own global `Scope` class cannot install this package.
+
+## Polyfill
+
+When no `Scope` class exists, the package declares one in userland with the same four methods and
+signatures. It keeps a stack of `run()` scopes per fiber (a `WeakMap` keyed by the fiber) and one
+for `{main}`. `fiber_interop\scope\IS_POLYFILL` is `true` when the polyfill is in use.
+
+It cannot add `Fiber::getScope()` or `Generator::getScope()`, and it has two gaps the extension
+closes (they are the RFC's motivation):
+
+- A fiber created with `new Fiber` by code that doesn't cooperate sees the root scope, not the
+  scope current at its construction. Libraries cooperate by capturing `Scope::getCurrent()` when
+  they create a fiber and calling `$scope->run(...)` inside it, as fiber-interop's `go()` and its
+  adapters do.
+- A generator sees the scope of the code iterating it, not the scope current when it was created.
+
+`getCurrent()` also costs a map lookup instead of a pointer read.
+
+Polyfill rules: it declares nothing if a `Scope` class already exists; it has exactly the
+extension's names and signatures and no extra methods (so new methods go into the RFC and the
+extension first); its major version follows the extension's; it does not `provide` `ext-scope`;
+its gaps are documented here and exposed through the `IS_POLYFILL` constant in the package's own
+namespace, never on the class.
 
 ## Rules
 
@@ -54,8 +98,8 @@ each with one user that is off by default.
 
 **Slots** are for new code: an extension allocates a slot at startup, and `scope_slot()` returns
 the current scope's copy of its state, created on first use. Outside any scope it returns the copy
-of an implicit root scope, so extension code never handles a missing scope; the root scope is
-internal, and `Scope::getCurrent()` still returns `null` there. A change of scope updates a
+of the root scope, so extension code never handles a missing scope; `Scope::getRootScope()` is
+that root scope's object, and `getRootScope()->run()` makes the root's state current. A change of scope updates a
 pointer. The demonstration user is a per-scope counter:
 
 ```ini
@@ -82,6 +126,8 @@ phpize
 ./configure --enable-scope
 make
 make test
+vendor/bin/phpunit                                       # polyfill (after composer install)
+php -d extension=modules/scope.so vendor/bin/phpunit     # same tests, extension
 php -d extension=modules/scope.so your-script.php
 ```
 
