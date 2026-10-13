@@ -3,12 +3,40 @@
     "description": "The Scope class from the PHP RFC \"Scope\", as a PHP extension (PHP 8.2+).",
     "type": "php-ext",
     "license": "MIT",
-    "authors": [{"name": "Frode Børli", "email": "frode@ennerd.com"}],
-    "require": {"php": ">=8.2"},
+    "authors": [
+        {
+            "name": "Frode Børli",
+            "email": "frode@ennerd.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.2"
+    },
     "php-ext": {
         "extension-name": "scope",
+        "priority": 80,
         "support-zts": true,
         "support-nts": true,
-        "configure-options": []
-    }
+        "configure-options": [
+            {
+                "name": "enable-scope",
+                "description": "Enable the Scope class",
+                "needs-value": false
+            }
+        ],
+        "download-url-method": [
+            "composer-default"
+        ],
+        "os-families-exclude": [
+            "windows"
+        ]
+    },
+    "keywords": [
+        "scope",
+        "fiber",
+        "async",
+        "extension",
+        "php-ext"
+    ],
+    "homepage": "https://wiki.php.net/rfc/scope"
 }
