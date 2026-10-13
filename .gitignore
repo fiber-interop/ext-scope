@@ -38,3 +38,4 @@ php_test_results_*.txt
 /vendor/
 /composer.lock
 /.phpunit.cache/
+.phpunit.result.cache
