@@ -26,6 +26,8 @@
 
 #include "php.h"
 #include "ext/standard/info.h"
+#include "SAPI.h"
+#include "main/php_globals.h"
 #include "zend_exceptions.h"
 #include "zend_fibers.h"
 #include "zend_generators.h"
@@ -52,6 +54,8 @@ typedef struct {
 	void (*init)(void *state);   /* the state of a new scope */
 	void (*destroy)(void *state);
 } scope_state;
+
+#define SCOPE_SG_N 5
 
 #define SCOPE_MAX_STATES 16
 static scope_state scope_states[SCOPE_MAX_STATES];
@@ -110,6 +114,7 @@ static void scope_slots_free(void **slots)
 typedef struct {
 	char *state;
 	void **slots;
+	zval *sg;   /* the five request superglobals while this scope is not the applied one (NULL: not tracked) */
 	zend_object std;
 } scope_object;
 
@@ -121,6 +126,8 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	zend_object *cur_scope; /* the current scope, NULL outside any (kept by scope_apply()) */
 	void **root_slots;      /* the implicit root scope's slots */
 	bool slot_demo;         /* INI scope.slot_demo */
+	bool superglobals;      /* INI scope.superglobals */
+	zval root_sg[SCOPE_SG_N]; /* the root scope's request superglobals while another scope is applied */
 	char *root_state;       /* the globals' own state while a scope's is applied */
 	bool active;            /* between RINIT and RSHUTDOWN */
 	zend_object *root;      /* Scope::getRootScope(), created on first use; internally the root is NULL */
@@ -208,6 +215,79 @@ static zend_object *scope_generator_create(zend_class_entry *ce)
 	return obj;
 }
 
+/* ---- the request superglobals (secondary vote A) ---------------------------
+ *
+ * $_GET, $_POST, $_COOKIE, $_FILES and $_REQUEST follow the scope. Compiled code
+ * reads and writes them through their entries in EG(symbol_table); C code (the
+ * filter extension, phpinfo) reads PG(http_globals)[TRACK_VARS_*], which holds a
+ * second reference to the same array. A switch moves the array of the scope being
+ * left out of the symbol table into that scope's storage, moves the incoming one
+ * in, and re-points http_globals at it: no array is copied or duplicated. */
+
+static const char *const scope_sg_names[SCOPE_SG_N] = { "_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST" };
+static const int scope_sg_track[SCOPE_SG_N] = { TRACK_VARS_GET, TRACK_VARS_POST, TRACK_VARS_COOKIE, TRACK_VARS_FILES, -1 };
+
+/* The live entry of a superglobal. The auto-globals are created lazily (auto_globals_jit),
+ * so the first time we need one, ask the engine to create it. */
+static zval *scope_sg_live(int i)
+{
+	zval *z = zend_hash_str_find(&EG(symbol_table), scope_sg_names[i], strlen(scope_sg_names[i]));
+
+	if (z == NULL) {
+		zend_is_auto_global_str(scope_sg_names[i], strlen(scope_sg_names[i]));
+		z = zend_hash_str_find(&EG(symbol_table), scope_sg_names[i], strlen(scope_sg_names[i]));
+	}
+	if (z != NULL && Z_TYPE_P(z) == IS_INDIRECT) {
+		z = Z_INDIRECT_P(z);
+	}
+	return z;
+}
+
+/* A new scope's own arrays: references to the creating scope's (copy-on-write). */
+static zval *scope_sg_snapshot(void)
+{
+	zval *sg = ecalloc(SCOPE_SG_N, sizeof(zval));
+
+	for (int i = 0; i < SCOPE_SG_N; i++) {
+		zval *live = scope_sg_live(i);
+		if (live != NULL) {
+			ZVAL_COPY_DEREF(&sg[i], live);
+		} else {
+			array_init(&sg[i]);
+		}
+	}
+	return sg;
+}
+
+static void scope_sg_free(zval *sg)
+{
+	if (sg) {
+		for (int i = 0; i < SCOPE_SG_N; i++) {
+			zval_ptr_dtor(&sg[i]);
+		}
+		efree(sg);
+	}
+}
+
+/* Swap the live arrays for the incoming scope's: out goes into from[], in comes from to[]. */
+static void scope_sg_swap(zval *from, zval *to)
+{
+	for (int i = 0; i < SCOPE_SG_N; i++) {
+		zval *live = scope_sg_live(i);
+
+		if (live == NULL || Z_TYPE(to[i]) == IS_UNDEF) {
+			continue;
+		}
+		ZVAL_COPY_VALUE(&from[i], live);
+		ZVAL_COPY_VALUE(live, &to[i]);
+		ZVAL_UNDEF(&to[i]);
+		if (scope_sg_track[i] >= 0) {
+			zval_ptr_dtor(&PG(http_globals)[scope_sg_track[i]]);
+			ZVAL_COPY(&PG(http_globals)[scope_sg_track[i]], live);
+		}
+	}
+}
+
 /* Make the globals hold the state of the scope that is current now. Called
  * wherever the current scope can change. */
 static void scope_apply(void)
@@ -224,7 +304,22 @@ static void scope_apply(void)
 		want = Z_OBJ_P(current);
 	}
 	SCOPE_G(cur_scope) = want;
-	if (scope_states_n == 0 || want == SCOPE_G(applied)) {
+	if (want == SCOPE_G(applied)) {
+		return;
+	}
+	if (SCOPE_G(superglobals)) {
+		zval *from = SCOPE_G(applied) ? SCOPE_OBJECT(SCOPE_G(applied))->sg : SCOPE_G(root_sg);
+		zval *to = want ? SCOPE_OBJECT(want)->sg : SCOPE_G(root_sg);
+
+		if (from == NULL || to == NULL) {
+			/* a scope that was created before the first switch has no storage only if
+			 * the ini is off; nothing to swap */
+		} else {
+			scope_sg_swap(from, to);
+		}
+	}
+	if (scope_states_n == 0) {
+		SCOPE_G(applied) = want;
 		return;
 	}
 	save = SCOPE_G(applied) ? SCOPE_OBJECT(SCOPE_G(applied))->state : SCOPE_G(root_state);
@@ -355,6 +450,9 @@ static zend_object *scope_create(zend_class_entry *ce)
 	zend_object_std_init(&so->std, ce);
 	object_properties_init(&so->std, ce);
 	so->std.handlers = &scope_handlers;
+	if (SCOPE_G(superglobals) && SCOPE_G(active)) {
+		so->sg = scope_sg_snapshot();
+	}
 	return &so->std;
 }
 
@@ -365,6 +463,7 @@ static void scope_free(zend_object *obj)
 		SCOPE_G(root) = NULL;   /* freed by the object store after RSHUTDOWN */
 	}
 	scope_slots_free(so->slots);
+	scope_sg_free(so->sg);
 	if (so->state) {
 		for (size_t i = 0; i < scope_states_n; i++) {
 			if (scope_states[i].destroy) {
@@ -384,6 +483,9 @@ static zend_object *scope_root(void)
 	if (SCOPE_G(root) == NULL) {
 		zval z;
 		object_init_ex(&z, scope_ce);
+		/* the root's arrays are the root_sg storage, not this object's */
+		scope_sg_free(SCOPE_OBJECT(Z_OBJ(z))->sg);
+		SCOPE_OBJECT(Z_OBJ(z))->sg = NULL;
 		SCOPE_G(root) = Z_OBJ(z);
 	}
 	return SCOPE_G(root);
@@ -570,6 +672,8 @@ static const zend_function_entry scope_demo_functions[] = {
 PHP_INI_BEGIN()
 	STD_PHP_INI_BOOLEAN("scope.isolate_json_errors", "0", PHP_INI_SYSTEM, OnUpdateBool,
 		isolate_json_errors, zend_scope_globals, scope_globals)
+	STD_PHP_INI_BOOLEAN("scope.superglobals", "1", PHP_INI_SYSTEM, OnUpdateBool,
+		superglobals, zend_scope_globals, scope_globals)
 	STD_PHP_INI_BOOLEAN("scope.slot_demo", "0", PHP_INI_SYSTEM, OnUpdateBool,
 		slot_demo, zend_scope_globals, scope_globals)
 PHP_INI_END()
@@ -640,6 +744,7 @@ static PHP_RINIT_FUNCTION(scope)
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(gen_prev), 16, NULL, NULL, 0);
+	memset(SCOPE_G(root_sg), 0, sizeof(SCOPE_G(root_sg)));
 	SCOPE_G(applied) = NULL;
 	SCOPE_G(cur_scope) = NULL;
 	SCOPE_G(root_slots) = NULL;

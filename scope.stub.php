@@ -8,6 +8,11 @@
 /**
  * Identifies one logical operation, such as a request, a job or a transaction.
  *
+ * With the ini setting scope.superglobals=1 (the default), $_GET, $_POST, $_COOKIE, $_FILES and
+ * $_REQUEST follow the scope: the root scope's arrays are the SAPI's, a new scope starts with
+ * copy-on-write copies of the creating scope's arrays, and writes inside a scope stay in it.
+ * $_SERVER, $_ENV and $_SESSION are not in scope.
+ *
  * @strict-properties
  * @not-serializable
  */

@@ -60,6 +60,26 @@ A project that declares its own global `Scope` class cannot install this package
 
 The RFC has the full motivation, the rules and prior art in other languages.
 
+## Request superglobals (secondary vote A)
+
+`$_GET`, `$_POST`, `$_COOKIE`, `$_FILES` and `$_REQUEST` follow the scope:
+
+- In the root scope they are the SAPI's arrays, so code that never creates a scope sees today's behaviour.
+- A new scope starts with its own copies of the five as they are in the scope that creates it
+  (copy-on-write: only a reference is taken, nothing is duplicated until someone writes).
+- An assignment or write inside a scope changes only that scope's array. Reads see the current scope's array;
+  every fiber and generator of the scope shares it. `$_REQUEST` is a snapshot like the others, not a live merge.
+- `$_SERVER`, `$_ENV` and `$_SESSION` are not in scope and are left untouched.
+
+When the current scope changes (`run()` entering or leaving, a fiber switch, a generator resuming or yielding) the
+five arrays are moved between the scope's storage and the live `EG(symbol_table)` entries, which is where compiled
+`$_GET` accesses read and write, and `PG(http_globals)[TRACK_VARS_*]` is re-pointed at the same array for C code
+such as `filter_input()`. The cost of a switch is five symbol-table lookups and pointer moves; no array is copied.
+The first scope creation makes the engine create the five lazily-created auto-globals (`auto_globals_jit`).
+
+`scope.superglobals` (default `1`, `PHP_INI_SYSTEM`) turns this off, so the vote can be shown independently
+of the base proposal: with `0`, all scopes share the SAPI's arrays.
+
 ## Per-scope state (prototype)
 
 A follow-up to the RFC plans an internal API with two layers, so that extensions can give implicit state one
