@@ -80,6 +80,33 @@ The first scope creation makes the engine create the five lazily-created auto-gl
 `scope.superglobals` (default `1`, `PHP_INI_SYSTEM`) turns this off, so the vote can be shown independently
 of the base proposal: with `0`, all scopes share the SAPI's arrays.
 
+## Default locale and timezone (secondary vote B)
+
+`date_default_timezone_get()/set()` (ext/date) and `Locale::getDefault()/setDefault()` (ext/intl, only when intl is
+loaded) follow the scope with the same rules as the superglobals: the root scope's values are today's (from ini and
+the SAPI), a new scope inherits its creator's values at creation (later changes in the creator are not seen), a change
+inside a scope affects only that scope, and code outside any scope sees no change. Fibers and generators of a scope
+share its values.
+
+How it is done, and what a switch costs:
+
+- **Timezone**: the string `date_default_timezone_set()` writes (ext/date's `timezone` global, `NULL` meaning "use
+  the `date.timezone` ini") is swapped as a pointer. ext/date does not export its globals, but `php_date.h` has the
+  struct and the module entry carries its address, found with `zend_hash_str_find_ptr(&module_registry, "date")`
+  at startup. Each scope owns a private copy (made at scope creation), because `date_default_timezone_set()` frees
+  the old string. A switch is one pointer swap; no allocation.
+- **Locale**: ext/intl keeps no state of its own: `Locale::setDefault()` writes the `intl.default_locale` ini entry
+  and `Locale::getDefault()` reads it. The extension holds a reference to the outgoing scope's value and, when the
+  incoming scope's value differs, writes the entry exactly as `Locale::setDefault()` does (`zend_alter_ini_entry`).
+  intl's globals (and headers) are not reachable from another extension, and going through the ini entry also keeps
+  the engine's ini restore at request end correct. When two scopes have the same locale a switch is a string
+  comparison; when they differ it allocates the new ini string (the one cost above two words).
+- `ini_set('date.timezone')` is a request-wide ini, not scope state. A scope that has set its own timezone is not
+  affected by it; a scope that never set one uses the ini value, which is the same for all of them.
+
+`scope.locale_timezone` (default `1`, `PHP_INI_SYSTEM`) turns this off independently of `scope.superglobals`:
+with `0`, all scopes share one timezone and one locale.
+
 ## Per-scope state (prototype)
 
 A follow-up to the RFC plans an internal API with two layers, so that extensions can give implicit state one

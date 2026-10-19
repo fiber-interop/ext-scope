@@ -24,6 +24,7 @@
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
+   <file name="Makefile.frag" role="src"/>
    <file name="scope.c" role="src"/>
    <file name="scope.stub.php" role="src"/>
    <file name="scope_arginfo.h" role="src"/>

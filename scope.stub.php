@@ -13,6 +13,10 @@
  * copy-on-write copies of the creating scope's arrays, and writes inside a scope stay in it.
  * $_SERVER, $_ENV and $_SESSION are not in scope.
  *
+ * With scope.locale_timezone=1 (the default) the default timezone (date_default_timezone_get()/
+ * set()) and, when intl is loaded, the default locale (Locale::getDefault()/setDefault()) follow
+ * the scope the same way: a new scope inherits its creator's values, a change stays in the scope.
+ *
  * @strict-properties
  * @not-serializable
  */

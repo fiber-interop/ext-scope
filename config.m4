@@ -5,4 +5,5 @@ PHP_ARG_ENABLE([scope],
 
 if test "$PHP_SCOPE" != "no"; then
   PHP_NEW_EXTENSION(scope, scope.c, $ext_shared)
+  PHP_ADD_MAKEFILE_FRAGMENT
 fi
