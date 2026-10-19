@@ -34,6 +34,7 @@
 #include "zend_observer.h"
 #include "zend_weakrefs.h"
 #include "ext/json/php_json.h"
+#include "ext/date/php_date.h"
 #include "scope_arginfo.h"
 
 #define PHP_SCOPE_VERSION "0.1.0"
@@ -110,11 +111,22 @@ static void scope_slots_free(void **slots)
 	efree(slots);
 }
 
+/* The default timezone and locale of a scope that is not the applied one (secondary vote B).
+ * The timezone is ext/date's SCOPE_DATEG()->timezone (the string date_default_timezone_set() writes;
+ * NULL: fall back to the date.timezone ini), owned by the holder. The locale is the value of the
+ * ini entry intl.default_locale, which is what Locale::setDefault() writes. */
+typedef struct {
+	char *tz;
+	zend_string *loc;
+	bool ready;
+} scope_tl;
+
 /* A Scope object, with its swapped globals and its slots (both allocated on first use). */
 typedef struct {
 	char *state;
 	void **slots;
 	zval *sg;   /* the five request superglobals while this scope is not the applied one (NULL: not tracked) */
+	scope_tl tl; /* the default timezone and locale while this scope is not the applied one */
 	zend_object std;
 } scope_object;
 
@@ -127,6 +139,9 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	void **root_slots;      /* the implicit root scope's slots */
 	bool slot_demo;         /* INI scope.slot_demo */
 	bool superglobals;      /* INI scope.superglobals */
+	bool locale_timezone;   /* INI scope.locale_timezone */
+	scope_tl root_tl;       /* the root scope's timezone and locale while another scope is applied */
+	zend_ini_entry *loc_ini; /* intl.default_locale; NULL when intl is not loaded */
 	zval root_sg[SCOPE_SG_N]; /* the root scope's request superglobals while another scope is applied */
 	char *root_state;       /* the globals' own state while a scope's is applied */
 	bool active;            /* between RINIT and RSHUTDOWN */
@@ -288,6 +303,85 @@ static void scope_sg_swap(zval *from, zval *to)
 	}
 }
 
+/* ---- the default timezone and locale (secondary vote B) -------------------- */
+
+/* ext/date does not export its globals to other extensions, but the struct layout is in
+ * php_date.h and the module entry carries the globals' address. */
+static zend_module_entry *scope_date_module;
+#ifdef ZTS
+# define SCOPE_DATEG() TSRMG_BULK_STATIC(*scope_date_module->globals_id_ptr, zend_date_globals *)
+#else
+# define SCOPE_DATEG() ((zend_date_globals *) scope_date_module->globals_ptr)
+#endif
+
+static void scope_tl_free(scope_tl *t)
+{
+	if (t->tz) {
+		efree(t->tz);
+	}
+	if (t->loc) {
+		zend_string_release(t->loc);
+	}
+	memset(t, 0, sizeof(*t));
+}
+
+/* Copy the live values into t, replacing what t held. */
+static void scope_tl_save(scope_tl *t)
+{
+	if (t->tz != SCOPE_DATEG()->timezone) {
+		if (t->tz) {
+			efree(t->tz);
+		}
+		t->tz = SCOPE_DATEG()->timezone ? estrdup(SCOPE_DATEG()->timezone) : NULL;
+	}
+	if (SCOPE_G(loc_ini) && t->loc != SCOPE_G(loc_ini)->value) {
+		zend_string *live = SCOPE_G(loc_ini)->value;
+		if (t->loc) {
+			zend_string_release(t->loc);
+		}
+		t->loc = live ? zend_string_copy(live) : NULL;
+	}
+	t->ready = true;
+}
+
+/* A new scope inherits the live values, which are its creator's. */
+static void scope_tl_inherit(scope_tl *t)
+{
+	memset(t, 0, sizeof(*t));
+	scope_tl_save(t);
+}
+
+/* Swap the live values with a scope's: the timezone is a pointer swap (the holder owns its
+ * string, so date_default_timezone_set() inside a scope frees only that scope's); the locale
+ * goes through the ini entry, as Locale::setDefault() does, and only when the two differ. */
+static void scope_tl_swap(scope_tl *from, scope_tl *to)
+{
+	char *tz = SCOPE_DATEG()->timezone;
+
+	if (!from->ready || !to->ready) {
+		return;
+	}
+	SCOPE_DATEG()->timezone = to->tz;
+	to->tz = NULL;
+	if (from->tz) {
+		efree(from->tz);
+	}
+	from->tz = tz;   /* the outgoing scope's string is now owned by its holder */
+	if (SCOPE_G(loc_ini)) {
+		zend_string *live = SCOPE_G(loc_ini)->value;
+		zend_string *want = to->loc;
+		if (from->loc != live) {
+			if (from->loc) {
+				zend_string_release(from->loc);
+			}
+			from->loc = live ? zend_string_copy(live) : NULL;
+		}
+		if (want && (live == NULL || !zend_string_equals(want, live))) {
+			zend_alter_ini_entry(SCOPE_G(loc_ini)->name, want, PHP_INI_USER, PHP_INI_STAGE_RUNTIME);
+		}
+	}
+}
+
 /* Make the globals hold the state of the scope that is current now. Called
  * wherever the current scope can change. */
 static void scope_apply(void)
@@ -317,6 +411,10 @@ static void scope_apply(void)
 		} else {
 			scope_sg_swap(from, to);
 		}
+	}
+	if (SCOPE_G(locale_timezone)) {
+		scope_tl_swap(SCOPE_G(applied) ? &SCOPE_OBJECT(SCOPE_G(applied))->tl : &SCOPE_G(root_tl),
+			want ? &SCOPE_OBJECT(want)->tl : &SCOPE_G(root_tl));
 	}
 	if (scope_states_n == 0) {
 		SCOPE_G(applied) = want;
@@ -453,6 +551,9 @@ static zend_object *scope_create(zend_class_entry *ce)
 	if (SCOPE_G(superglobals) && SCOPE_G(active)) {
 		so->sg = scope_sg_snapshot();
 	}
+	if (SCOPE_G(locale_timezone) && SCOPE_G(active)) {
+		scope_tl_inherit(&so->tl);
+	}
 	return &so->std;
 }
 
@@ -464,6 +565,7 @@ static void scope_free(zend_object *obj)
 	}
 	scope_slots_free(so->slots);
 	scope_sg_free(so->sg);
+	scope_tl_free(&so->tl);
 	if (so->state) {
 		for (size_t i = 0; i < scope_states_n; i++) {
 			if (scope_states[i].destroy) {
@@ -486,6 +588,7 @@ static zend_object *scope_root(void)
 		/* the root's arrays are the root_sg storage, not this object's */
 		scope_sg_free(SCOPE_OBJECT(Z_OBJ(z))->sg);
 		SCOPE_OBJECT(Z_OBJ(z))->sg = NULL;
+		scope_tl_free(&SCOPE_OBJECT(Z_OBJ(z))->tl);
 		SCOPE_G(root) = Z_OBJ(z);
 	}
 	return SCOPE_G(root);
@@ -674,6 +777,8 @@ PHP_INI_BEGIN()
 		isolate_json_errors, zend_scope_globals, scope_globals)
 	STD_PHP_INI_BOOLEAN("scope.superglobals", "1", PHP_INI_SYSTEM, OnUpdateBool,
 		superglobals, zend_scope_globals, scope_globals)
+	STD_PHP_INI_BOOLEAN("scope.locale_timezone", "1", PHP_INI_SYSTEM, OnUpdateBool,
+		locale_timezone, zend_scope_globals, scope_globals)
 	STD_PHP_INI_BOOLEAN("scope.slot_demo", "0", PHP_INI_SYSTEM, OnUpdateBool,
 		slot_demo, zend_scope_globals, scope_globals)
 PHP_INI_END()
@@ -689,6 +794,11 @@ static PHP_GINIT_FUNCTION(scope)
 static PHP_MINIT_FUNCTION(scope)
 {
 	REGISTER_INI_ENTRIES();
+	scope_date_module = zend_hash_str_find_ptr(&module_registry, ZEND_STRL("date"));
+	if (scope_date_module == NULL) {
+		return FAILURE;
+	}
+	SCOPE_G(loc_ini) = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("intl.default_locale"));
 	scope_ce = register_class_Scope();
 	memcpy(&scope_handlers, &std_object_handlers, sizeof(zend_object_handlers));
 	scope_handlers.offset = XtOffsetOf(scope_object, std);
@@ -745,6 +855,10 @@ static PHP_RINIT_FUNCTION(scope)
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(gen_prev), 16, NULL, NULL, 0);
 	memset(SCOPE_G(root_sg), 0, sizeof(SCOPE_G(root_sg)));
+	memset(&SCOPE_G(root_tl), 0, sizeof(SCOPE_G(root_tl)));
+	if (SCOPE_G(locale_timezone)) {
+		scope_tl_save(&SCOPE_G(root_tl));
+	}
 	SCOPE_G(applied) = NULL;
 	SCOPE_G(cur_scope) = NULL;
 	SCOPE_G(root_slots) = NULL;
@@ -766,6 +880,7 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 		efree(SCOPE_G(root_state));
 		SCOPE_G(root_state) = NULL;
 	}
+	scope_tl_free(&SCOPE_G(root_tl));
 	scope_slots_free(SCOPE_G(root_slots));
 	SCOPE_G(root_slots) = NULL;
 	SCOPE_G(active) = false;
@@ -791,8 +906,14 @@ static PHP_MINFO_FUNCTION(scope)
 	DISPLAY_INI_ENTRIES();
 }
 
+static const zend_module_dep scope_deps[] = {
+	ZEND_MOD_REQUIRED("date")
+	ZEND_MOD_OPTIONAL("intl")
+	ZEND_MOD_END
+};
+
 zend_module_entry scope_module_entry = {
-	STANDARD_MODULE_HEADER,
+	STANDARD_MODULE_HEADER_EX, NULL, scope_deps,
 	"scope",
 	NULL,
 	PHP_MINIT(scope),

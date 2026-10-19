@@ -2,6 +2,7 @@
 Superglobals: with scope.superglobals=0 the arrays are shared by every scope
 --EXTENSIONS--
 scope
+--INI--
 scope.superglobals=0
 --FILE--
 <?php
