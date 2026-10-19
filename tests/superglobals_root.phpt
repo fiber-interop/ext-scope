@@ -1,0 +1,16 @@
+--TEST--
+Superglobals: the root scope's arrays are the SAPI's, unchanged for code that never creates a scope
+--EXTENSIONS--
+scope
+--FILE--
+<?php
+$_GET = ["a" => 1]; $_POST = ["p" => 2]; $_COOKIE = ["c" => 3]; $_FILES = []; $_REQUEST = ["r" => 4];
+function f() { return $_GET["a"] . $_POST["p"] . $_COOKIE["c"] . $_REQUEST["r"]; }
+echo f(), "\n";
+$_GET["b"] = 5;
+echo json_encode($_GET), "\n";
+echo json_encode(Scope::getRootScope()->run(fn() => $GLOBALS["_GET"])), "\n";
+--EXPECT--
+1234
+{"a":1,"b":5}
+{"a":1,"b":5}
