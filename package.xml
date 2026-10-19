@@ -10,17 +10,17 @@
   <email>frode@ennerd.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-13</date>
+ <date>2026-10-19</date>
  <version>
-  <release>0.1.0</release>
-  <api>0.1.0</api>
+  <release>0.3.0</release>
+  <api>0.3.0</api>
  </version>
  <stability>
   <release>alpha</release>
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>First release: Scope with getRootScope(), getCurrent(), run(); Fiber::getScope() and Generator::getScope().</notes>
+ <notes>Scope spec level 0.3.0: the RFC draft plus secondary votes A (per-scope request superglobals, ini scope.superglobals) and B (per-scope default timezone and locale, ini scope.locale_timezone). Includes Scope with getRootScope(), getCurrent(), run(); Fiber::getScope() and Generator::getScope().</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>

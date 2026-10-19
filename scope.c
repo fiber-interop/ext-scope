@@ -37,7 +37,7 @@
 #include "ext/date/php_date.h"
 #include "scope_arginfo.h"
 
-#define PHP_SCOPE_VERSION "0.1.0"
+#define PHP_SCOPE_VERSION "0.3.0"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
