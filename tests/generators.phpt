@@ -27,10 +27,15 @@ echo "Generator::getScope(): ", name($gen->getScope()), "\n";
 $gen = $a->run(fn() => (function () { yield current_name(); })());
 echo "first value, consumed from {main}: ", $gen->current(), "\n";
 
-// yield from: the inner generator runs in its own scope.
+// yield from: the delegation chain runs in the scope of the generator being
+// resumed (the outermost), like any other iterator it delegates to.
 $inner = $b->run(fn() => (function () { yield current_name(); })());
 $outer = $a->run(fn() => (function () use ($inner) { yield current_name(); yield from $inner; yield current_name(); })());
 echo "yield from: ", implode(',', iterator_to_array($outer, false)), "\n";
+// Resumed directly, the inner generator runs in its own scope.
+$inner = $b->run(fn() => (function () { yield current_name(); yield current_name(); })());
+$outer = $a->run(fn() => (function () use ($inner) { yield from $inner; })());
+echo "inner resumed directly: ", $inner->current(), ", via outer: ", $outer->current(), "\n";
 
 // A generator inside a fiber that suspends while the generator is inside run().
 $gen = $a->run(fn() => (function () use ($b) {
@@ -52,7 +57,8 @@ generator: after second yield A
 consumer still in: B
 Generator::getScope(): A
 first value, consumed from {main}: A
-yield from: A,B,A
+yield from: A,A,A
+inner resumed directly: B, via outer: B
 main while the generator is inside run: root
 generator in fiber yields: A
 closure created in A, called in B: B

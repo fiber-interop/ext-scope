@@ -16,8 +16,9 @@
  * entry goes away with its fiber or generator, and (since PHP 8.3) the cycle
  * collector sees through it. {main} has its own array. SCOPE_G(cur) points at the
  * array of the code running now. It changes when execution switches fibers (the
- * fiber switch observer) and when a generator's body is entered or left (the call
- * observer, registered for generator functions only).
+ * fiber switch observer) and when a generator is resumed from outside or yields
+ * back (wrappers around the Generator methods, its iterator and its destructor;
+ * there is no fcall observer, so ordinary calls pay nothing).
  */
 
 #ifdef HAVE_CONFIG_H
@@ -151,7 +152,6 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	zval members;           /* WeakMap: Fiber|Generator => its array */
 	HashTable ctx_cur;      /* (uintptr_t)zend_fiber_context => zend_array* of the code it was running */
 	HashTable ctx_owned;    /* arrays of fiber contexts that aren't Fiber objects */
-	HashTable gen_prev;     /* (uintptr_t)zend_generator => zend_array* to return to on yield */
 ZEND_END_MODULE_GLOBALS(scope)
 
 ZEND_DECLARE_MODULE_GLOBALS(scope)
@@ -167,6 +167,9 @@ static zend_class_entry *scope_weakmap_ce;   /* WeakMap's entry isn't exported *
 static zend_object_handlers scope_handlers;
 static zend_object *(*scope_fiber_create_orig)(zend_class_entry *ce);
 static zend_object *(*scope_generator_create_orig)(zend_class_entry *ce);
+static zend_object_handlers scope_generator_handlers;   /* the engine's, with dtor_obj wrapped */
+static const zend_object_handlers *scope_generator_handlers_orig;
+static void scope_generator_dtor(zend_object *obj);
 
 #define SCOPE_KEY(p) ((zend_ulong) (uintptr_t) (p))
 
@@ -226,6 +229,15 @@ static zend_object *scope_fiber_create(zend_class_entry *ce)
 static zend_object *scope_generator_create(zend_class_entry *ce)
 {
 	zend_object *obj = scope_generator_create_orig(ce);
+
+	if (scope_generator_handlers_orig == NULL) {
+		scope_generator_handlers_orig = obj->handlers;
+		scope_generator_handlers = *obj->handlers;
+		scope_generator_handlers.dtor_obj = scope_generator_dtor;
+	}
+	if (obj->handlers == scope_generator_handlers_orig) {
+		obj->handlers = &scope_generator_handlers;
+	}
 	scope_register_member(obj);
 	return obj;
 }
@@ -501,43 +513,151 @@ static void scope_fiber_destroy(zend_fiber_context *ctx)
 	zend_hash_index_del(&SCOPE_G(ctx_owned), SCOPE_KEY(ctx));
 }
 
-/* ---- generators: enter the generator's array while its body runs ---------- */
+/* ---- generators: run the generator's body in its array --------------------
+ *
+ * A generator's body only runs when something resumes it from outside: a
+ * Generator method, a foreach (or other engine iteration) through its iterator,
+ * or its destructor running pending finally blocks. Each of those entry points is
+ * wrapped: it enters the generator's array, calls the original, and returns to
+ * the caller's array, also when the body throws. Nothing is added to ordinary
+ * function calls (an fcall observer would put every call on the observed path).
+ *
+ * yield from: the engine resumes the generators of a delegation chain inside one
+ * resume of the generator it was asked to resume, with no hook in between. The
+ * whole chain therefore runs in the array of that generator, the outermost one
+ * being resumed: a delegated generator behaves like any other delegated iterator,
+ * whose methods also run in the scope of the generator delegating to it. Resumed
+ * directly, a generator runs in its own scope as usual. */
 
-/* For a generator's frame, EX(return_value) holds the generator itself. */
-static void scope_generator_begin(zend_execute_data *execute_data)
+static zend_always_inline zend_array *scope_generator_enter(zend_object *g)
 {
-	zend_generator *g = (zend_generator *) EX(return_value);
-	zend_array *a;
+	zend_array *prev = SCOPE_G(cur), *a = scope_member_array(g);
 
-	if (g == NULL || (a = scope_member_array(&g->std)) == NULL) {
-		return;
+	if (a == NULL || a == prev) {
+		return NULL;
 	}
-	zend_hash_index_update_ptr(&SCOPE_G(gen_prev), SCOPE_KEY(g), SCOPE_G(cur));
 	SCOPE_G(cur) = a;
 	scope_apply();
+	return prev;
 }
 
-static void scope_generator_end(zend_execute_data *execute_data, zval *retval)
+static zend_always_inline void scope_generator_leave(zend_array *prev)
 {
-	zend_generator *g = (zend_generator *) EX(return_value);
-	zend_array *prev;
-
-	if (!SCOPE_G(active) || g == NULL) {
-		return;
-	}
-	if ((prev = zend_hash_index_find_ptr(&SCOPE_G(gen_prev), SCOPE_KEY(g))) != NULL) {
+	if (prev != NULL && SCOPE_G(active)) {
 		SCOPE_G(cur) = prev;
-		zend_hash_index_del(&SCOPE_G(gen_prev), SCOPE_KEY(g));
 		scope_apply();
 	}
 }
 
-static zend_observer_fcall_handlers scope_observer_init(zend_execute_data *execute_data)
-{
-	if (EX(func)->common.fn_flags & ZEND_ACC_GENERATOR) {
-		return (zend_observer_fcall_handlers) { scope_generator_begin, scope_generator_end };
+/* Generator methods */
+#define SCOPE_GENERATOR_METHODS(X) \
+	X(rewind) X(valid) X(current) X(key) X(next) X(send) X(throw) X(getReturn)
+
+#define SCOPE_GM_ORIG(name) static zif_handler scope_gm_orig_##name;
+SCOPE_GENERATOR_METHODS(SCOPE_GM_ORIG)
+
+#define SCOPE_GM_WRAP(name) \
+	static ZEND_NAMED_FUNCTION(scope_gm_##name) \
+	{ \
+		zend_array *prev = scope_generator_enter(Z_OBJ_P(ZEND_THIS)); \
+		scope_gm_orig_##name(INTERNAL_FUNCTION_PARAM_PASSTHRU); \
+		scope_generator_leave(prev); \
 	}
-	return (zend_observer_fcall_handlers) { NULL, NULL };
+SCOPE_GENERATOR_METHODS(SCOPE_GM_WRAP)
+
+static void scope_generator_methods_swap(bool install)
+{
+	zend_function *f;
+
+#define SCOPE_GM_SWAP(name) \
+	if ((f = zend_hash_str_find_ptr_lc(&zend_ce_generator->function_table, #name, sizeof(#name) - 1)) != NULL) { \
+		if (install) { \
+			scope_gm_orig_##name = f->internal_function.handler; \
+			f->internal_function.handler = scope_gm_##name; \
+		} else if (scope_gm_orig_##name) { \
+			f->internal_function.handler = scope_gm_orig_##name; \
+		} \
+	}
+	SCOPE_GENERATOR_METHODS(SCOPE_GM_SWAP)
+}
+
+/* foreach and the other engine iteration: the generator's iterator */
+#if PHP_VERSION_ID < 80400
+typedef int scope_valid_result;
+#else
+typedef zend_result scope_valid_result;
+#endif
+
+static zend_object_iterator *(*scope_generator_get_iterator_orig)(zend_class_entry *ce, zval *object, int by_ref);
+static zend_object_iterator_funcs scope_gi_funcs;
+static const zend_object_iterator_funcs *scope_gi_orig;
+
+static void scope_gi_rewind(zend_object_iterator *it)
+{
+	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	scope_gi_orig->rewind(it);
+	scope_generator_leave(prev);
+}
+
+static scope_valid_result scope_gi_valid(zend_object_iterator *it)
+{
+	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	scope_valid_result r = scope_gi_orig->valid(it);
+	scope_generator_leave(prev);
+	return r;
+}
+
+static zval *scope_gi_get_current_data(zend_object_iterator *it)
+{
+	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	zval *r = scope_gi_orig->get_current_data(it);
+	scope_generator_leave(prev);
+	return r;
+}
+
+static void scope_gi_get_current_key(zend_object_iterator *it, zval *key)
+{
+	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	scope_gi_orig->get_current_key(it, key);
+	scope_generator_leave(prev);
+}
+
+static void scope_gi_move_forward(zend_object_iterator *it)
+{
+	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	scope_gi_orig->move_forward(it);
+	scope_generator_leave(prev);
+}
+
+static zend_object_iterator *scope_generator_get_iterator(zend_class_entry *ce, zval *object, int by_ref)
+{
+	zend_object_iterator *it = scope_generator_get_iterator_orig(ce, object, by_ref);
+
+	if (it == NULL) {
+		return NULL;
+	}
+	if (scope_gi_orig == NULL) {
+		scope_gi_orig = it->funcs;
+		scope_gi_funcs = *it->funcs;
+		scope_gi_funcs.rewind = scope_gi_rewind;
+		scope_gi_funcs.valid = scope_gi_valid;
+		scope_gi_funcs.get_current_data = scope_gi_get_current_data;
+		scope_gi_funcs.get_current_key = scope_gi_get_current_key;
+		scope_gi_funcs.move_forward = scope_gi_move_forward;
+	}
+	if (it->funcs == scope_gi_orig) {
+		it->funcs = &scope_gi_funcs;
+	}
+	return it;
+}
+
+/* The destructor runs pending finally blocks of an unfinished generator. */
+
+static void scope_generator_dtor(zend_object *obj)
+{
+	zend_array *prev = scope_generator_enter(obj);
+	scope_generator_handlers_orig->dtor_obj(obj);
+	scope_generator_leave(prev);
 }
 
 /* ---- Scope ---------------------------------------------------------------- */
@@ -817,11 +937,13 @@ static PHP_MINIT_FUNCTION(scope)
 	zend_ce_fiber->create_object = scope_fiber_create;
 	scope_generator_create_orig = zend_ce_generator->create_object;
 	zend_ce_generator->create_object = scope_generator_create;
+	scope_generator_get_iterator_orig = zend_ce_generator->get_iterator;
+	zend_ce_generator->get_iterator = scope_generator_get_iterator;
+	scope_generator_methods_swap(true);
 
 	zend_observer_fiber_init_register(scope_fiber_init);
 	zend_observer_fiber_switch_register(scope_fiber_switch);
 	zend_observer_fiber_destroy_register(scope_fiber_destroy);
-	zend_observer_fcall_register(scope_observer_init);
 	if (SCOPE_G(isolate_json_errors)) {
 		scope_register_json();
 	}
@@ -836,6 +958,8 @@ static PHP_MSHUTDOWN_FUNCTION(scope)
 {
 	zend_ce_fiber->create_object = scope_fiber_create_orig;
 	zend_ce_generator->create_object = scope_generator_create_orig;
+	zend_ce_generator->get_iterator = scope_generator_get_iterator_orig;
+	scope_generator_methods_swap(false);
 	UNREGISTER_INI_ENTRIES();
 	return SUCCESS;
 }
@@ -853,7 +977,6 @@ static PHP_RINIT_FUNCTION(scope)
 	object_init_ex(&SCOPE_G(members), scope_weakmap_ce);
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
-	zend_hash_init(&SCOPE_G(gen_prev), 16, NULL, NULL, 0);
 	memset(SCOPE_G(root_sg), 0, sizeof(SCOPE_G(root_sg)));
 	memset(&SCOPE_G(root_tl), 0, sizeof(SCOPE_G(root_tl)));
 	if (SCOPE_G(locale_timezone)) {
@@ -885,7 +1008,6 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 	SCOPE_G(root_slots) = NULL;
 	SCOPE_G(active) = false;
 	SCOPE_G(cur) = NULL;
-	zend_hash_destroy(&SCOPE_G(gen_prev));
 	zend_hash_destroy(&SCOPE_G(ctx_owned));
 	zend_hash_destroy(&SCOPE_G(ctx_cur));
 	zval_ptr_dtor(&SCOPE_G(members));
