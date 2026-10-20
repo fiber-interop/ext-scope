@@ -37,6 +37,8 @@
     <file name="fibers.phpt" role="test"/>
     <file name="gc.phpt" role="test"/>
     <file name="generators.phpt" role="test"/>
+    <file name="generators_resume.phpt" role="test"/>
+    <file name="generators_switches.phpt" role="test"/>
     <file name="root.phpt" role="test"/>
     <file name="run.phpt" role="test"/>
     <file name="state_json.phpt" role="test"/>

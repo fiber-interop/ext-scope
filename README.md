@@ -153,13 +153,20 @@ php -d extension=modules/scope.so your-script.php
 ## Cost
 
 An extension can't add fields to the engine's fiber and generator objects, so this one keeps each
-fiber's and generator's scope in a `WeakMap` and follows execution with the engine's observer
-API. Measured on PHP 8.5 (x86-64):
+fiber's and generator's scope in a `WeakMap`. It follows fiber switches with the engine's fiber
+observer. For generators it compiles scope switches into generator bodies only (a `zend_extension`
+op_array handler, registered by the extension itself): the body switches to the generator's scope
+when it starts, after each `yield` and at each `catch` and `finally`, and back to the resumer's scope
+before each `yield`, `yield from` and `return`. An exception escaping the body is handled where the
+generator is resumed (the `Generator` methods, its iterator for `foreach`, its destructor). Every other
+function compiles exactly as without the extension, and there is no function call observer, so ordinary
+calls cost nothing extra and the JIT stays on. Measured on PHP 8.5 (x86-64, `php -n`):
 
 | | Without | With |
 |---|---|---|
-| Function call | ~25 ns | ~29 ns |
-| Generator step | ~38 ns | ~79 ns |
+| Function call | ~25 ns | ~25 ns |
+| Generator step (`valid()`, `current()`, `next()`) | ~67 ns | ~98 ns |
+| Generator step (`foreach`) | ~37 ns | ~70 ns |
 | Fiber resume and suspend | ~108 ns | ~163 ns |
 
 An implementation in the engine stores the scope in the fiber or generator itself, which makes
