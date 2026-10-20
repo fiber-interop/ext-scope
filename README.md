@@ -39,6 +39,10 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Release 0.3.1
+
+0.3.1 removes the per-call cost of loading the extension: generators now switch scope through calls compiled into generator bodies only, instead of an fcall observer that put every function call on PHP's observed path (#3). Same spec level as 0.3.0.
+
 ## Release 0.3.0
 
 0.3.0 is the "Scope spec level": the RFC draft plus both secondary votes. It contains the `Scope` class (`getRootScope()`, `getCurrent()`, `run()`), `Fiber::getScope()` and `Generator::getScope()`, per-scope request superglobals (vote A, ini `scope.superglobals`), per-scope default timezone and locale (vote B, ini `scope.locale_timezone`), and PIE metadata (`composer.json`, `config.m4`). The polyfill `fiber-interop/scope` 0.3.0 implements the same level.
