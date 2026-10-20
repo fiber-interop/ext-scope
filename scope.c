@@ -17,7 +17,7 @@
  * collector sees through it. {main} has its own array. SCOPE_G(cur) points at the
  * array of the code running now. It changes when execution switches fibers (the
  * fiber switch observer) and when a generator is resumed from outside or yields
- * back (wrappers around the Generator methods, its iterator and its destructor;
+ * back (switches compiled into generator bodies only, see "generators" below;
  * there is no fcall observer, so ordinary calls pay nothing).
  */
 
@@ -30,6 +30,7 @@
 #include "SAPI.h"
 #include "main/php_globals.h"
 #include "zend_exceptions.h"
+#include "zend_extensions.h"
 #include "zend_fibers.h"
 #include "zend_generators.h"
 #include "zend_observer.h"
@@ -152,6 +153,10 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	zval members;           /* WeakMap: Fiber|Generator => its array */
 	HashTable ctx_cur;      /* (uintptr_t)zend_fiber_context => zend_array* of the code it was running */
 	HashTable ctx_owned;    /* arrays of fiber contexts that aren't Fiber objects */
+	zend_array *resumer;    /* the array of the code resuming a generator now; NULL: none */
+	HashTable ctx_resumer;  /* (uintptr_t)zend_fiber_context => its resumer while it is not running */
+	zend_object *gen_last;  /* the generator that switched in last, and its array (a lookup cache) */
+	zend_array *gen_last_a;
 ZEND_END_MODULE_GLOBALS(scope)
 
 ZEND_DECLARE_MODULE_GLOBALS(scope)
@@ -170,6 +175,7 @@ static zend_object *(*scope_generator_create_orig)(zend_class_entry *ce);
 static zend_object_handlers scope_generator_handlers;   /* the engine's, with dtor_obj wrapped */
 static const zend_object_handlers *scope_generator_handlers_orig;
 static void scope_generator_dtor(zend_object *obj);
+static void scope_generator_free(zend_object *obj);
 
 #define SCOPE_KEY(p) ((zend_ulong) (uintptr_t) (p))
 
@@ -234,6 +240,7 @@ static zend_object *scope_generator_create(zend_class_entry *ce)
 		scope_generator_handlers_orig = obj->handlers;
 		scope_generator_handlers = *obj->handlers;
 		scope_generator_handlers.dtor_obj = scope_generator_dtor;
+		scope_generator_handlers.free_obj = scope_generator_free;
 	}
 	if (obj->handlers == scope_generator_handlers_orig) {
 		obj->handlers = &scope_generator_handlers;
@@ -499,6 +506,13 @@ static void scope_fiber_switch(zend_fiber_context *from, zend_fiber_context *to)
 		return;
 	}
 	zend_hash_index_update_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(from), SCOPE_G(cur));
+	if (SCOPE_G(resumer)) {
+		zend_hash_index_update_ptr(&SCOPE_G(ctx_resumer), SCOPE_KEY(from), SCOPE_G(resumer));
+	} else if (zend_hash_num_elements(&SCOPE_G(ctx_resumer))) {
+		zend_hash_index_del(&SCOPE_G(ctx_resumer), SCOPE_KEY(from));
+	}
+	SCOPE_G(resumer) = zend_hash_num_elements(&SCOPE_G(ctx_resumer))
+		? zend_hash_index_find_ptr(&SCOPE_G(ctx_resumer), SCOPE_KEY(to)) : NULL;
 	a = zend_hash_index_find_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(to));
 	SCOPE_G(cur) = a ? a : Z_ARR(SCOPE_G(main));
 	scope_apply();
@@ -511,40 +525,415 @@ static void scope_fiber_destroy(zend_fiber_context *ctx)
 	}
 	zend_hash_index_del(&SCOPE_G(ctx_cur), SCOPE_KEY(ctx));
 	zend_hash_index_del(&SCOPE_G(ctx_owned), SCOPE_KEY(ctx));
+	zend_hash_index_del(&SCOPE_G(ctx_resumer), SCOPE_KEY(ctx));
 }
 
-/* ---- generators: run the generator's body in its array --------------------
+/* ---- generators: switches compiled into generator bodies -------------------
  *
- * A generator's body only runs when something resumes it from outside: a
- * Generator method, a foreach (or other engine iteration) through its iterator,
- * or its destructor running pending finally blocks. Each of those entry points is
- * wrapped: it enters the generator's array, calls the original, and returns to
- * the caller's array, also when the body throws. Nothing is added to ordinary
- * function calls (an fcall observer would put every call on the observed path).
+ * A generator's body runs in its own array. ZEND_ACC_GENERATOR is known at
+ * compile time, so the op_array handler (registered as a zend_extension at MINIT)
+ * rewrites generator bodies only, and every other function compiles exactly as
+ * without this extension:
  *
- * yield from: the engine resumes the generators of a delegation chain inside one
- * resume of the generator it was asked to resume, with no hook in between. The
- * whole chain therefore runs in the array of that generator, the outermost one
- * being resumed: a delegated generator behaves like any other delegated iterator,
- * whose methods also run in the scope of the generator delegating to it. Resumed
- * directly, a generator runs in its own scope as usual. */
+ *   - at the start of the body (after GENERATOR_CREATE), after each YIELD and
+ *     YIELD_FROM, at the start of each catch block (after its CATCH) and of each
+ *     finally block (which a destructor or throw() can jump to directly):
+ *     switch in, to the generator's array;
+ *   - before each YIELD, YIELD_FROM and return (GENERATOR_RETURN): switch out,
+ *     back to the resumer's array.
+ *
+ * The resumer is whoever resumed the generator from outside: a Generator method,
+ * the iterator foreach uses, or the destructor. Each of those is wrapped: it
+ * records the array of the code calling it as the resumer (SCOPE_G(resumer),
+ * saved per fiber context like SCOPE_G(cur)) and, when the original returns or
+ * throws, restores that array; an exception escaping the body passes no switch.
+ *
+ * yield from: each generator of a delegation chain switches itself in and out,
+ * so each body runs in its own scope; between them (and in an iterator that is
+ * not a generator, delegated to) the resumer's scope is current. */
 
-static zend_always_inline zend_array *scope_generator_enter(zend_object *g)
+static zend_always_inline zend_generator *scope_generator_of(zend_execute_data *ex)
 {
-	zend_array *prev = SCOPE_G(cur), *a = scope_member_array(g);
+	/* A generator's frame holds the generator in return_value. */
+	return ex && ex->func && ZEND_USER_CODE(ex->func->type) && (ex->func->op_array.fn_flags & ZEND_ACC_GENERATOR)
+		? (zend_generator *) ex->return_value : NULL;
+}
 
-	if (a == NULL || a == prev) {
-		return NULL;
+static void scope_generator_in(zend_execute_data *ex)
+{
+	zend_generator *g = scope_generator_of(ex);
+	zend_array *a;
+
+	if (g == NULL) {
+		return;
+	}
+	if (&g->std == SCOPE_G(gen_last)) {
+		a = SCOPE_G(gen_last_a);
+	} else if ((a = scope_member_array(&g->std)) != NULL) {
+		SCOPE_G(gen_last) = &g->std;
+		SCOPE_G(gen_last_a) = a;
+	}
+	if (a == NULL || a == SCOPE_G(cur)) {
+		return;
 	}
 	SCOPE_G(cur) = a;
 	scope_apply();
-	return prev;
 }
 
-static zend_always_inline void scope_generator_leave(zend_array *prev)
+static void scope_generator_out(zend_execute_data *ex)
 {
-	if (prev != NULL && SCOPE_G(active)) {
-		SCOPE_G(cur) = prev;
+	zend_array *r = SCOPE_G(resumer);
+
+	if (r == NULL || r == SCOPE_G(cur) || !SCOPE_G(active) || scope_generator_of(ex) == NULL) {
+		return;
+	}
+	SCOPE_G(cur) = r;
+	scope_apply();
+}
+
+/* The two functions the switches call: frameless on PHP 8.4+ (no frame, and the
+ * JIT calls the handler directly), with a frame before. */
+ZEND_FUNCTION(scope_generator_switch_in)
+{
+	scope_generator_in(execute_data->prev_execute_data);
+}
+
+ZEND_FUNCTION(scope_generator_switch_out)
+{
+	scope_generator_out(execute_data->prev_execute_data);
+}
+
+#if PHP_VERSION_ID >= 80400
+ZEND_FRAMELESS_FUNCTION(scope_generator_switch_in, 0)
+{
+	scope_generator_in(EG(current_execute_data));
+}
+
+ZEND_FRAMELESS_FUNCTION(scope_generator_switch_out, 0)
+{
+	scope_generator_out(EG(current_execute_data));
+}
+
+static const zend_frameless_function_info scope_switch_in_flf[] = {
+	{ ZEND_FRAMELESS_FUNCTION_NAME(scope_generator_switch_in, 0), 0 },
+	{ 0 },
+};
+static const zend_frameless_function_info scope_switch_out_flf[] = {
+	{ ZEND_FRAMELESS_FUNCTION_NAME(scope_generator_switch_out, 0), 0 },
+	{ 0 },
+};
+static uint32_t scope_switch_flf[2];
+#endif
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_scope_generator_switch, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
+/* Internal: they act only when called from a generator's body. */
+#define SCOPE_SWITCH_IN_NAME "scope\\internal\\generator_switch_in"
+#define SCOPE_SWITCH_OUT_NAME "scope\\internal\\generator_switch_out"
+static const zend_function_entry scope_switch_functions[] = {
+	{ .fname = SCOPE_SWITCH_IN_NAME, .handler = ZEND_FN(scope_generator_switch_in),
+	  .arg_info = arginfo_scope_generator_switch, .num_args = 0, .flags = 0,
+#if PHP_VERSION_ID >= 80400
+	  .frameless_function_infos = scope_switch_in_flf,
+#endif
+	},
+	{ .fname = SCOPE_SWITCH_OUT_NAME, .handler = ZEND_FN(scope_generator_switch_out),
+	  .arg_info = arginfo_scope_generator_switch, .num_args = 0, .flags = 0,
+#if PHP_VERSION_ID >= 80400
+	  .frameless_function_infos = scope_switch_out_flf,
+#endif
+	},
+	ZEND_FE_END
+};
+static zend_string *scope_switch_name[2];
+static zend_function *scope_switch_func[2];
+
+/* The rewrite runs on the raw op_array at the start of pass_two(), before jump
+ * targets become offsets (and before RETURN becomes GENERATOR_RETURN), like
+ * ext-phasync's checkpoint injection: every opline number the op_array and the
+ * compiler context refer to is moved past the calls inserted before it. */
+static void scope_raw_map_targets(zend_op_array *op_array, uint32_t (*map)(uint32_t, void *), void *arg)
+{
+	for (uint32_t i = 0; i < op_array->last; i++) {
+		zend_op *op = &op_array->opcodes[i];
+
+		switch (op->opcode) {
+			case ZEND_JMP:
+				op->op1.opline_num = map(op->op1.opline_num, arg);
+				break;
+			case ZEND_CATCH:
+				if (op->extended_value & ZEND_LAST_CATCH) {
+					break;
+				}
+				ZEND_FALLTHROUGH;
+			case ZEND_JMPZ:
+			case ZEND_JMPNZ:
+			case ZEND_JMPZ_EX:
+			case ZEND_JMPNZ_EX:
+			case ZEND_JMP_SET:
+			case ZEND_COALESCE:
+			case ZEND_FE_RESET_R:
+			case ZEND_FE_RESET_RW:
+			case ZEND_JMP_NULL:
+			case ZEND_ASSERT_CHECK:
+#ifdef ZEND_BIND_INIT_STATIC_OR_JMP   /* PHP 8.3+ */
+			case ZEND_BIND_INIT_STATIC_OR_JMP:
+#endif
+#if PHP_VERSION_ID >= 80400
+			case ZEND_JMP_FRAMELESS:
+#endif
+				op->op2.opline_num = map(op->op2.opline_num, arg);
+				break;
+			case ZEND_FE_FETCH_R:
+			case ZEND_FE_FETCH_RW:
+				op->extended_value = map(op->extended_value, arg);
+				break;
+			case ZEND_SWITCH_LONG:
+			case ZEND_SWITCH_STRING:
+			case ZEND_MATCH: {
+				zval *zv;
+
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(CT_CONSTANT_EX(op_array, op->op2.constant)), zv) {
+					Z_LVAL_P(zv) = map((uint32_t) Z_LVAL_P(zv), arg);
+				} ZEND_HASH_FOREACH_END();
+				op->extended_value = map(op->extended_value, arg);
+				break;
+			}
+		}
+	}
+	for (int i = 0; i < op_array->last_try_catch; i++) {
+		zend_try_catch_element *tc = &op_array->try_catch_array[i];
+
+		tc->try_op = map(tc->try_op, arg);
+		tc->catch_op = map(tc->catch_op, arg);
+		tc->finally_op = map(tc->finally_op, arg);
+		tc->finally_end = map(tc->finally_end, arg);
+	}
+	for (int i = 0; i < CG(context).last_brk_cont; i++) {
+		zend_brk_cont_element *bc = &CG(context).brk_cont_array[i];
+
+		if (bc->start >= 0) {
+			bc->start = (int) map((uint32_t) bc->start, arg);
+		}
+		if (bc->cont >= 0) {
+			bc->cont = (int) map((uint32_t) bc->cont, arg);
+		}
+		if (bc->brk >= 0) {
+			bc->brk = (int) map((uint32_t) bc->brk, arg);
+		}
+	}
+	if (CG(context).labels) {
+		zend_label *label;
+
+		ZEND_HASH_FOREACH_PTR(CG(context).labels, label) {
+			label->opline_num = map(label->opline_num, arg);
+		} ZEND_HASH_FOREACH_END();
+	}
+}
+
+typedef struct {
+	const uint32_t *at;   /* sorted insertion points, as (opline << 1 | out) */
+	uint32_t n;
+} scope_shift;
+
+#define SCOPE_SWITCH_OPS 2   /* FRAMELESS_ICALL_0 + FREE, or INIT_FCALL + DO_ICALL */
+
+/* A target moves past the switches inserted before it; one at an insertion point
+ * lands on that point's first switch. (0 stays 0: nothing is inserted before the
+ * first opline, so an unused try_catch offset keeps its meaning.) */
+static uint32_t scope_shift_target(uint32_t t, void *arg)
+{
+	const scope_shift *s = arg;
+	uint32_t lo = 0, hi = s->n;
+
+	while (lo < hi) {   /* how many insertion points are < t */
+		uint32_t mid = (lo + hi) / 2;
+
+		if ((s->at[mid] >> 1) < t) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return t + lo * SCOPE_SWITCH_OPS;
+}
+
+static int scope_cmp_u32(const void *a, const void *b)
+{
+	uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
+	return x < y ? -1 : x > y;
+}
+
+static uint32_t scope_add_literal(zend_op_array *op_array, zend_string *str)
+{
+	uint32_t lit = op_array->last_literal;
+
+	if (lit >= CG(context).literals_size) {
+		CG(context).literals_size += 16;
+		op_array->literals = erealloc(op_array->literals, CG(context).literals_size * sizeof(zval));
+	}
+	ZVAL_INTERNED_STR(&op_array->literals[lit], str);
+	Z_EXTRA(op_array->literals[lit]) = 0;
+	op_array->last_literal++;
+	return lit;
+}
+
+static void scope_op_array_handler(zend_op_array *op_array)
+{
+	uint32_t *at, n = 0, last = op_array->last, max;
+	zend_op *opcodes;
+	scope_shift shift;
+
+	if (!(op_array->fn_flags & ZEND_ACC_GENERATOR)) {
+		return;
+	}
+	max = 2 * last + op_array->last_try_catch;
+	at = emalloc(max * sizeof(uint32_t));
+#define SCOPE_AT(pos, out) (at[n++] = (uint32_t) (pos) << 1 | (out))
+	for (uint32_t i = 0; i < last; i++) {
+		switch (op_array->opcodes[i].opcode) {
+			case ZEND_GENERATOR_CREATE:
+			case ZEND_CATCH:
+				SCOPE_AT(i + 1, 0);
+				break;
+			case ZEND_YIELD:
+			case ZEND_YIELD_FROM:
+				SCOPE_AT(i, 1);
+				SCOPE_AT(i + 1, 0);
+				break;
+			case ZEND_RETURN:
+			case ZEND_RETURN_BY_REF:
+			case ZEND_GENERATOR_RETURN:
+				SCOPE_AT(i, 1);
+				break;
+		}
+	}
+	for (int i = 0; i < op_array->last_try_catch; i++) {
+		if (op_array->try_catch_array[i].finally_op) {
+			SCOPE_AT(op_array->try_catch_array[i].finally_op, 0);
+		}
+	}
+#undef SCOPE_AT
+	/* By opline; at one opline, switching in before switching out. */
+	qsort(at, n, sizeof(uint32_t), scope_cmp_u32);
+
+	shift = (scope_shift) { at, n };
+	scope_raw_map_targets(op_array, scope_shift_target, &shift);
+
+	opcodes = emalloc(sizeof(zend_op) * (last + n * SCOPE_SWITCH_OPS));
+	for (uint32_t i = 0, j = 0, o = 0; i <= last; i++) {
+		while (j < n && (at[j] >> 1) == i) {
+			const zend_op *next = &op_array->opcodes[i < last ? i : last - 1];
+			uint32_t out = at[j] & 1;
+			zend_op *sw = &opcodes[o];
+
+			memset(sw, 0, sizeof(zend_op) * SCOPE_SWITCH_OPS);
+			for (uint32_t c = 0; c < SCOPE_SWITCH_OPS; c++) {
+				SET_UNUSED(sw[c].op1);
+				SET_UNUSED(sw[c].op2);
+				SET_UNUSED(sw[c].result);
+				sw[c].lineno = next->lineno;
+			}
+#if PHP_VERSION_ID >= 80400
+			sw[0].opcode = ZEND_FRAMELESS_ICALL_0;
+			sw[0].extended_value = scope_switch_flf[out];
+			sw[0].result_type = IS_TMP_VAR;
+			sw[0].result.var = op_array->T;
+			sw[1].opcode = ZEND_FREE;
+			sw[1].op1_type = IS_TMP_VAR;
+			sw[1].op1.var = op_array->T++;
+#else
+			sw[0].opcode = ZEND_INIT_FCALL;
+			sw[0].op1.num = zend_vm_calc_used_stack(0, scope_switch_func[out]);
+			sw[0].op2_type = IS_CONST;
+			sw[0].op2.constant = scope_add_literal(op_array, scope_switch_name[out]);
+			sw[0].result.num = op_array->cache_size;
+			op_array->cache_size += sizeof(void *);
+			sw[1].opcode = ZEND_DO_ICALL;
+#endif
+			o += SCOPE_SWITCH_OPS;
+			j++;
+		}
+		if (i < last) {
+			opcodes[o++] = op_array->opcodes[i];
+		}
+	}
+	efree(op_array->opcodes);
+	op_array->opcodes = opcodes;
+	op_array->last = last + n * SCOPE_SWITCH_OPS;
+	CG(context).opcodes_size = op_array->last;
+	efree(at);
+}
+
+static zend_extension scope_zend_extension = {
+	.name = "scope",
+	.version = PHP_SCOPE_VERSION,
+	.author = "fiber-interop",
+	.op_array_handler = scope_op_array_handler,
+	.resource_number = -1,
+};
+
+/* eval() compiles without ZEND_COMPILE_HANDLE_OP_ARRAY (ZEND_COMPILE_DEFAULT_FOR_EVAL
+ * is 0), so op_array handlers don't see eval'd code: turn it on while eval'd code
+ * compiles. */
+static zend_op_array *(*scope_compile_string_orig)(zend_string *source, const char *filename, zend_compile_position position);
+
+static zend_op_array *scope_compile_string(zend_string *source, const char *filename, zend_compile_position position)
+{
+	uint32_t options = CG(compiler_options);
+	zend_op_array *op_array;
+
+	CG(compiler_options) |= ZEND_COMPILE_HANDLE_OP_ARRAY;
+	op_array = scope_compile_string_orig(source, filename, position);
+	CG(compiler_options) = options;
+	return op_array;
+}
+
+/* MINIT: the switch functions and the compile hook. A regular extension (and
+ * ext-phasync, which bundles this one and calls its MINIT) registers the
+ * zend_extension itself; zend_register_extension() also sets the flag that
+ * makes pass_two() call op_array handlers. */
+static void scope_generator_switches_startup(void)
+{
+	zend_register_functions(NULL, scope_switch_functions, NULL, MODULE_PERSISTENT);
+	scope_switch_name[0] = zend_string_init_interned(ZEND_STRL(SCOPE_SWITCH_IN_NAME), 1);
+	scope_switch_name[1] = zend_string_init_interned(ZEND_STRL(SCOPE_SWITCH_OUT_NAME), 1);
+	scope_switch_func[0] = zend_hash_find_ptr(CG(function_table), scope_switch_name[0]);
+	scope_switch_func[1] = zend_hash_find_ptr(CG(function_table), scope_switch_name[1]);
+#if PHP_VERSION_ID >= 80400
+	for (uint32_t i = 0; zend_flf_handlers[i]; i++) {
+		if (zend_flf_handlers[i] == (void *) ZEND_FRAMELESS_FUNCTION_NAME(scope_generator_switch_in, 0)) {
+			scope_switch_flf[0] = i;
+		} else if (zend_flf_handlers[i] == (void *) ZEND_FRAMELESS_FUNCTION_NAME(scope_generator_switch_out, 0)) {
+			scope_switch_flf[1] = i;
+		}
+	}
+#endif
+	zend_register_extension(&scope_zend_extension, NULL);
+	scope_compile_string_orig = zend_compile_string;
+	zend_compile_string = scope_compile_string;
+}
+
+/* The resume entry points: record the caller as the resumer, and restore its
+ * array when the original returns or throws. */
+typedef struct {
+	zend_array *cur, *resumer;
+} scope_resume;
+
+static zend_always_inline scope_resume scope_resume_begin(void)
+{
+	scope_resume r = { SCOPE_G(cur), SCOPE_G(resumer) };
+
+	SCOPE_G(resumer) = r.cur;
+	return r;
+}
+
+static zend_always_inline void scope_resume_end(scope_resume r)
+{
+	SCOPE_G(resumer) = r.resumer;
+	if (SCOPE_G(cur) != r.cur && SCOPE_G(active)) {
+		SCOPE_G(cur) = r.cur;
 		scope_apply();
 	}
 }
@@ -559,9 +948,9 @@ SCOPE_GENERATOR_METHODS(SCOPE_GM_ORIG)
 #define SCOPE_GM_WRAP(name) \
 	static ZEND_NAMED_FUNCTION(scope_gm_##name) \
 	{ \
-		zend_array *prev = scope_generator_enter(Z_OBJ_P(ZEND_THIS)); \
+		scope_resume r = scope_resume_begin(); \
 		scope_gm_orig_##name(INTERNAL_FUNCTION_PARAM_PASSTHRU); \
-		scope_generator_leave(prev); \
+		scope_resume_end(r); \
 	}
 SCOPE_GENERATOR_METHODS(SCOPE_GM_WRAP)
 
@@ -594,39 +983,39 @@ static const zend_object_iterator_funcs *scope_gi_orig;
 
 static void scope_gi_rewind(zend_object_iterator *it)
 {
-	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	scope_resume r = scope_resume_begin();
 	scope_gi_orig->rewind(it);
-	scope_generator_leave(prev);
+	scope_resume_end(r);
 }
 
 static scope_valid_result scope_gi_valid(zend_object_iterator *it)
 {
-	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
-	scope_valid_result r = scope_gi_orig->valid(it);
-	scope_generator_leave(prev);
-	return r;
+	scope_resume r = scope_resume_begin();
+	scope_valid_result v = scope_gi_orig->valid(it);
+	scope_resume_end(r);
+	return v;
 }
 
 static zval *scope_gi_get_current_data(zend_object_iterator *it)
 {
-	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
-	zval *r = scope_gi_orig->get_current_data(it);
-	scope_generator_leave(prev);
-	return r;
+	scope_resume r = scope_resume_begin();
+	zval *v = scope_gi_orig->get_current_data(it);
+	scope_resume_end(r);
+	return v;
 }
 
 static void scope_gi_get_current_key(zend_object_iterator *it, zval *key)
 {
-	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	scope_resume r = scope_resume_begin();
 	scope_gi_orig->get_current_key(it, key);
-	scope_generator_leave(prev);
+	scope_resume_end(r);
 }
 
 static void scope_gi_move_forward(zend_object_iterator *it)
 {
-	zend_array *prev = scope_generator_enter(Z_OBJ(it->data));
+	scope_resume r = scope_resume_begin();
 	scope_gi_orig->move_forward(it);
-	scope_generator_leave(prev);
+	scope_resume_end(r);
 }
 
 static zend_object_iterator *scope_generator_get_iterator(zend_class_entry *ce, zval *object, int by_ref)
@@ -655,9 +1044,17 @@ static zend_object_iterator *scope_generator_get_iterator(zend_class_entry *ce, 
 
 static void scope_generator_dtor(zend_object *obj)
 {
-	zend_array *prev = scope_generator_enter(obj);
+	scope_resume r = scope_resume_begin();
 	scope_generator_handlers_orig->dtor_obj(obj);
-	scope_generator_leave(prev);
+	scope_resume_end(r);
+}
+
+static void scope_generator_free(zend_object *obj)
+{
+	if (obj == SCOPE_G(gen_last)) {
+		SCOPE_G(gen_last) = NULL;
+	}
+	scope_generator_handlers_orig->free_obj(obj);
 }
 
 /* ---- Scope ---------------------------------------------------------------- */
@@ -940,6 +1337,7 @@ static PHP_MINIT_FUNCTION(scope)
 	scope_generator_get_iterator_orig = zend_ce_generator->get_iterator;
 	zend_ce_generator->get_iterator = scope_generator_get_iterator;
 	scope_generator_methods_swap(true);
+	scope_generator_switches_startup();
 
 	zend_observer_fiber_init_register(scope_fiber_init);
 	zend_observer_fiber_switch_register(scope_fiber_switch);
@@ -960,6 +1358,7 @@ static PHP_MSHUTDOWN_FUNCTION(scope)
 	zend_ce_generator->create_object = scope_generator_create_orig;
 	zend_ce_generator->get_iterator = scope_generator_get_iterator_orig;
 	scope_generator_methods_swap(false);
+	zend_compile_string = scope_compile_string_orig;
 	UNREGISTER_INI_ENTRIES();
 	return SUCCESS;
 }
@@ -977,6 +1376,9 @@ static PHP_RINIT_FUNCTION(scope)
 	object_init_ex(&SCOPE_G(members), scope_weakmap_ce);
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
+	zend_hash_init(&SCOPE_G(ctx_resumer), 8, NULL, NULL, 0);
+	SCOPE_G(resumer) = NULL;
+	SCOPE_G(gen_last) = NULL;
 	memset(SCOPE_G(root_sg), 0, sizeof(SCOPE_G(root_sg)));
 	memset(&SCOPE_G(root_tl), 0, sizeof(SCOPE_G(root_tl)));
 	if (SCOPE_G(locale_timezone)) {
@@ -1010,6 +1412,9 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 	SCOPE_G(cur) = NULL;
 	zend_hash_destroy(&SCOPE_G(ctx_owned));
 	zend_hash_destroy(&SCOPE_G(ctx_cur));
+	zend_hash_destroy(&SCOPE_G(ctx_resumer));
+	SCOPE_G(resumer) = NULL;
+	SCOPE_G(gen_last) = NULL;
 	zval_ptr_dtor(&SCOPE_G(members));
 	zval_ptr_dtor(&SCOPE_G(main));
 	if (SCOPE_G(root)) {
