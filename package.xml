@@ -10,17 +10,17 @@
   <email>frode@ennerd.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-19</date>
+ <date>2026-10-23</date>
  <version>
-  <release>0.3.1</release>
-  <api>0.3.0</api>
+  <release>0.4.0</release>
+  <api>0.4.0</api>
  </version>
  <stability>
   <release>alpha</release>
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.3.1: generators switch scope through code compiled into generator bodies; no fcall observer, so ordinary calls cost the same as without the extension (fixes #3). Scope spec level 0.3.0: the RFC draft plus secondary votes A (per-scope request superglobals, ini scope.superglobals) and B (per-scope default timezone and locale, ini scope.locale_timezone). Includes Scope with getRootScope(), getCurrent(), run(); Fiber::getScope() and Generator::getScope().</notes>
+ <notes>0.4.0: Scope RFC 0.9. A new scope starts with empty request superglobals (no copy of its creator's) and with the ini timezone and locale; the session (ext/session's request state, ini scope.session) follows the scope and is written and closed when the scope is destroyed; Scope::bind(Closure): Closure. Includes Scope with getRootScope(), getCurrent(), run(), bind(); Fiber::getScope() and Generator::getScope().</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
@@ -33,16 +33,46 @@
    <dir name="tests">
     <file name="names.inc" role="test"/>
     <file name="bailout.phpt" role="test"/>
+    <file name="bind.phpt" role="test"/>
+    <file name="bind_rebind.phpt" role="test"/>
     <file name="callbacks.phpt" role="test"/>
     <file name="fibers.phpt" role="test"/>
     <file name="gc.phpt" role="test"/>
     <file name="generators.phpt" role="test"/>
     <file name="generators_resume.phpt" role="test"/>
     <file name="generators_switches.phpt" role="test"/>
+    <file name="localetz_date_output.phpt" role="test"/>
+    <file name="localetz_inherit.phpt" role="test"/>
+    <file name="localetz_ini_off.phpt" role="test"/>
+    <file name="localetz_ini_set.phpt" role="test"/>
+    <file name="localetz_isolation.phpt" role="test"/>
+    <file name="localetz_locale_ini_off.phpt" role="test"/>
+    <file name="localetz_locale_isolation.phpt" role="test"/>
+    <file name="localetz_locale_stress.phpt" role="test"/>
+    <file name="localetz_new_from_ini.phpt" role="test"/>
+    <file name="localetz_outside.phpt" role="test"/>
+    <file name="localetz_root.phpt" role="test"/>
+    <file name="localetz_sharing.phpt" role="test"/>
+    <file name="localetz_stress.phpt" role="test"/>
     <file name="root.phpt" role="test"/>
     <file name="run.phpt" role="test"/>
+    <file name="session_ini.phpt" role="test"/>
+    <file name="session_scope.phpt" role="test"/>
     <file name="state_json.phpt" role="test"/>
     <file name="state_slots.phpt" role="test"/>
+    <file name="superglobals_fibers_share.phpt" role="test"/>
+    <file name="superglobals_globals_follow.phpt" role="test"/>
+    <file name="superglobals_inherit.phpt" role="test"/>
+    <file name="superglobals_ini_off.phpt" role="test"/>
+    <file name="superglobals_isolation.phpt" role="test"/>
+    <file name="superglobals_not_in_scope.phpt" role="test"/>
+    <file name="superglobals_request.phpt" role="test"/>
+    <file name="superglobals_root.phpt" role="test"/>
+    <file name="superglobals_server_inherit.phpt" role="test"/>
+    <file name="superglobals_server_isolation.phpt" role="test"/>
+    <file name="superglobals_server_switching.phpt" role="test"/>
+    <file name="superglobals_sharing.phpt" role="test"/>
+    <file name="superglobals_stress.phpt" role="test"/>
    </dir>
   </dir>
  </contents>

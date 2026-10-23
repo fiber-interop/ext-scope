@@ -13,6 +13,7 @@ final class Scope
 {
     public function __construct() {}
     public function run(callable $callback, mixed ...$args): mixed {}
+    public function bind(Closure $closure): Closure {}
     public static function getCurrent(): Scope {}
     public static function getRootScope(): Scope {}
 }
@@ -38,6 +39,20 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `getScope()` never return `null`. "Am I inside an operation" is
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
+
+## Release 0.4.0
+
+0.4.0 implements the Scope RFC 0.9:
+
+- **A new scope starts empty** (vote A): `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES`, `$_REQUEST` and `$_SERVER` are
+  empty arrays in a new `Scope`, instead of copy-on-write copies of its creator's. The root scope keeps the SAPI's
+  arrays; fibers and generators still join the scope they are created in.
+- **The session follows the scope** (vote A, ini `scope.session`): see "Session" below.
+- **Locale and timezone start from ini** (vote B): a new scope starts with the `date.timezone` ini (or its
+  fallback) and the `intl.default_locale` ini, not with its creator's values.
+- **`Scope::bind(Closure $closure): Closure`**: see "bind()" below.
+
+Code that relied on a new scope inheriting its creator's superglobals, timezone or locale must now seed the scope.
 
 ## Release 0.3.1
 
@@ -73,14 +88,14 @@ The RFC has the full motivation, the rules and prior art in other languages.
 `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES`, `$_REQUEST` and `$_SERVER` follow the scope:
 
 - In the root scope they are the SAPI's arrays, so code that never creates a scope sees today's behaviour.
-- A new scope starts with its own copies of the six as they are in the scope that creates it
-  (copy-on-write: only a reference is taken, nothing is duplicated until someone writes).
+- A new scope starts with six empty arrays, wherever it is created; whoever creates it seeds them, as a server
+  does for each request. The creator's arrays are not copied.
 - An assignment or write inside a scope changes only that scope's array. Reads see the current scope's array;
-  every fiber and generator of the scope shares it. `$_REQUEST` is a snapshot like the others, not a live merge.
+  every fiber and generator of the scope shares it. `$_REQUEST` is an array like the others, not a live merge.
 - `$_SERVER` carries both the request (`REQUEST_URI`, `HTTP_*`, ...) and the environment (`PATH`,
-  `DOCUMENT_ROOT`, ...); both follow the scope the same way, so a new scope's `$_SERVER` starts as a copy of
-  its creator's, environment entries included.
-- `$_ENV` and `$_SESSION` are not in scope and are left untouched.
+  `DOCUMENT_ROOT`, ...); both follow the scope the same way, so a new scope's `$_SERVER` starts empty, environment
+  entries included (read what you need from the root's `$_SERVER` before seeding).
+- `$_ENV` describes the process and is not in scope. `$_SESSION` follows the scope's session (below).
 
 When the current scope changes (`run()` entering or leaving, a fiber switch, a generator resuming or yielding) the
 six arrays are moved between the scope's storage and the live `EG(symbol_table)` entries, which is where compiled
@@ -89,13 +104,38 @@ such as `filter_input()`. The cost of a switch is six symbol-table lookups and p
 The first scope creation makes the engine create the six lazily-created auto-globals (`auto_globals_jit`).
 
 `scope.superglobals` (default `1`, `PHP_INI_SYSTEM`) turns this off, so the vote can be shown independently
-of the base proposal: with `0`, all scopes share the SAPI's arrays.
+of the base proposal: with `0`, all scopes share the SAPI's arrays (and the session, see below).
+
+### Session
+
+When ext/session is loaded (it is an optional dependency), its request state follows the scope too:
+
+- Swapped at each scope change: `$_SESSION` (kept in step with ext/session's `http_session_vars`), the session id,
+  status, the save handler module and its data (`mod`, `mod_data`), user save handlers
+  (`session_set_save_handler()`: the handler callables, class name, open/implemented flags), the serialized original
+  data (`session_vars`), `send_cookie`, `define_sid`, `in_save_handler`, `set_handler` and the "started at" file and
+  line. These are the `PS()` globals ext/session's RINIT and RSHUTDOWN reset; phasync's `sapi()` swaps the same set.
+- Also swapped, as ini values re-applied through the entries' own handlers when two scopes differ: `session.name`,
+  `session.save_path`, `session.cache_limiter`, `session.cache_expire` and the `session.cookie_*` entries (lifetime,
+  path, domain, secure, httponly, samesite, partitioned), that is what `session_name()`, `session_save_path()`,
+  `session_set_cookie_params()` and `session_cache_limiter()`/`session_cache_expire()` change.
+- A new scope has no session (`PHP_SESSION_NONE`), the ini values of those entries, and the save handler of the
+  `session.save_handler` ini (not a handler the creator set with `session_set_save_handler()`).
+- `session_start()` inside a scope starts that scope's session; all its fibers and generators share it.
+- A scope destroyed with its session active writes and closes it, as request end does; scopes still alive at
+  request end are written and closed before ext/session's own shutdown handles the root's.
+- Not swapped: other session ini entries (`session.save_handler`, `session.serialize_handler`, `use_*`, gc settings)
+  stay request-wide. While no scope has session data, `$_SESSION` is an ordinary global.
+
+`scope.session` (default `1`, `PHP_INI_SYSTEM`) turns only this off; it is also off when `scope.superglobals=0`.
+The session is not swapped on ZTS builds.
 
 ## Default locale and timezone (secondary vote B)
 
 `date_default_timezone_get()/set()` (ext/date) and `Locale::getDefault()/setDefault()` (ext/intl, only when intl is
 loaded) follow the scope with the same rules as the superglobals: the root scope's values are today's (from ini and
-the SAPI), a new scope inherits its creator's values at creation (later changes in the creator are not seen), a change
+the SAPI), a new scope starts with the ini values (`date.timezone`, or its fallback when unset; `intl.default_locale`,
+or ICU's default at request start when unset), not with its creator's, a change
 inside a scope affects only that scope, and code outside any scope sees no change. Fibers and generators of a scope
 share its values.
 
@@ -104,7 +144,7 @@ How it is done, and what a switch costs:
 - **Timezone**: the string `date_default_timezone_set()` writes (ext/date's `timezone` global, `NULL` meaning "use
   the `date.timezone` ini") is swapped as a pointer. ext/date does not export its globals, but `php_date.h` has the
   struct and the module entry carries its address, found with `zend_hash_str_find_ptr(&module_registry, "date")`
-  at startup. Each scope owns a private copy (made at scope creation), because `date_default_timezone_set()` frees
+  at startup. Each scope owns a private copy, because `date_default_timezone_set()` frees
   the old string. A switch is one pointer swap; no allocation.
 - **Locale**: ext/intl keeps no state of its own: `Locale::setDefault()` writes the `intl.default_locale` ini entry
   and `Locale::getDefault()` reads it. The extension holds a reference to the outgoing scope's value and, when the
@@ -117,6 +157,20 @@ How it is done, and what a switch costs:
 
 `scope.locale_timezone` (default `1`, `PHP_INI_SYSTEM`) turns this off independently of `scope.superglobals`:
 with `0`, all scopes share one timezone and one locale.
+
+## bind()
+
+`$scope->bind($closure)` returns a new closure that runs `$closure` with `$scope` current, exactly as `run()` would,
+whoever calls it and from whichever scope: the previous scope is restored when it returns or throws, and calls nest.
+Generators and fibers created inside such a call belong to `$scope`. `$closure` itself is unchanged and still runs in
+its caller's scope. Binding a closure that `bind()` returned replaces its scope rather than nesting:
+`$a->bind($b->bind($fn))` runs `$fn` in `$a`.
+
+The returned closure is a native wrapper that uses `$closure`'s own parameter info, so it keeps its signature
+(by-reference parameters, defaults, variadics, return type, named arguments) and its `$this` and class scope; it is not
+a variadic `fn(...$a) => $scope->run($closure, ...$a)`, which would lose by-reference parameters. Reflection reports
+it as an internal function with `$closure`'s parameters; default values of its parameters are not visible to
+Reflection, and it does not return by reference.
 
 ## Per-scope state (prototype)
 

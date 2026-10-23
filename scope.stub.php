@@ -27,6 +27,12 @@ final class Scope
     /** Calls $callback with this scope as the current scope, and returns its result. */
     public function run(callable $callback, mixed ...$args): mixed {}
 
+    /**
+     * A new closure that runs $closure with this scope current, as run() does, whoever calls it.
+     * It has $closure's signature, $this and class scope; $closure itself is not modified.
+     */
+    public function bind(Closure $closure): Closure {}
+
     /** The current scope; the root scope outside any run(). */
     public static function getCurrent(): Scope {}
 

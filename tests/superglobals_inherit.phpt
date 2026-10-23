@@ -1,5 +1,5 @@
 --TEST--
-Superglobals: a new scope starts with the arrays of the scope that creates it; writes in the child do not touch the parent (copy-on-write)
+Superglobals: a new scope starts with six empty arrays, not its creator's; writes in it do not touch the root
 --EXTENSIONS--
 scope
 --FILE--
@@ -14,6 +14,6 @@ echo show(), "\n";
 // grandchild inherits from its creator scope, not from the root
 $s->run(function () { $g = new Scope(); echo json_encode($g->run(fn() => $_GET)), "\n"; });
 --EXPECT--
-[{"a":1},{"p":1},{"c":1},{"f":1},{"r":1}]
+[[],[],[],[],[]]
 [{"a":1,"late":1},{"p":1},{"c":1},{"f":1},{"r":1}]
-{"a":1,"child":1}
+[]
