@@ -58,7 +58,7 @@ typedef struct {
 	void (*destroy)(void *state);
 } scope_state;
 
-#define SCOPE_SG_N 5
+#define SCOPE_SG_N 6
 
 #define SCOPE_MAX_STATES 16
 static scope_state scope_states[SCOPE_MAX_STATES];
@@ -127,7 +127,7 @@ typedef struct {
 typedef struct {
 	char *state;
 	void **slots;
-	zval *sg;   /* the five request superglobals while this scope is not the applied one (NULL: not tracked) */
+	zval *sg;   /* the six request superglobals while this scope is not the applied one (NULL: not tracked) */
 	scope_tl tl; /* the default timezone and locale while this scope is not the applied one */
 	zend_object std;
 } scope_object;
@@ -251,15 +251,17 @@ static zend_object *scope_generator_create(zend_class_entry *ce)
 
 /* ---- the request superglobals (secondary vote A) ---------------------------
  *
- * $_GET, $_POST, $_COOKIE, $_FILES and $_REQUEST follow the scope. Compiled code
- * reads and writes them through their entries in EG(symbol_table); C code (the
+ * $_GET, $_POST, $_COOKIE, $_FILES, $_REQUEST and $_SERVER follow the scope. Compiled
+ * code reads and writes them through their entries in EG(symbol_table); C code (the
  * filter extension, phpinfo) reads PG(http_globals)[TRACK_VARS_*], which holds a
  * second reference to the same array. A switch moves the array of the scope being
  * left out of the symbol table into that scope's storage, moves the incoming one
- * in, and re-points http_globals at it: no array is copied or duplicated. */
+ * in, and re-points http_globals at it: no array is copied or duplicated.
+ * $_REQUEST has no http_globals slot (it is built by the SAPI, not tracked there),
+ * so its scope_sg_track entry is -1. */
 
-static const char *const scope_sg_names[SCOPE_SG_N] = { "_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST" };
-static const int scope_sg_track[SCOPE_SG_N] = { TRACK_VARS_GET, TRACK_VARS_POST, TRACK_VARS_COOKIE, TRACK_VARS_FILES, -1 };
+static const char *const scope_sg_names[SCOPE_SG_N] = { "_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST", "_SERVER" };
+static const int scope_sg_track[SCOPE_SG_N] = { TRACK_VARS_GET, TRACK_VARS_POST, TRACK_VARS_COOKIE, TRACK_VARS_FILES, -1, TRACK_VARS_SERVER };
 
 /* The live entry of a superglobal. The auto-globals are created lazily (auto_globals_jit),
  * so the first time we need one, ask the engine to create it. */

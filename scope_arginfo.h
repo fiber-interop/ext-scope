@@ -1,7 +1,7 @@
 /* Hand-edited (getRootScope added, getCurrent non-nullable): gen_stub.php was not available.
  * The stub hash below is stale; regenerate from scope.stub.php with gen_stub.php. */
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: ce6fedc6b9662ec9ddb0ee1c948c0108a3ddf731 */
+ * Stub hash: f432f6fe82e64a3852a02737b718f36d89f983d9 */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_class_Scope___construct, 0, 0, 0)
 ZEND_END_ARG_INFO()
