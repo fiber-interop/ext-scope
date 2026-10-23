@@ -13,5 +13,5 @@ $s->run(function () { echo date_default_timezone_get(), "\n"; date_default_timez
 echo date_default_timezone_get(), "\n";
 --EXPECT--
 Europe/Oslo
-Asia/Tokyo
+Europe/Oslo
 Asia/Tokyo

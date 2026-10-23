@@ -6,6 +6,7 @@ scope
 <?php
 $_GET = ["n" => 0];
 $a = new Scope(); $b = new Scope();
+$a->run(function () { $_GET = ["n" => 0]; });
 $gen = $a->run(function () { return (function () { $_GET["n"]++; yield $_GET["n"]; $_GET["n"]++; yield $_GET["n"]; })(); });
 $f = $a->run(fn() => new Fiber(function () { $_GET["n"] += 10; Fiber::suspend(); echo "A fiber sees ", $_GET["n"], "\n"; }));
 $fb = $b->run(fn() => new Fiber(function () { $_GET["n"] = "B"; Fiber::suspend(); echo "B fiber sees ", $_GET["n"], "\n"; }));

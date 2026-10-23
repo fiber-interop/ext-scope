@@ -1,5 +1,5 @@
 --TEST--
-Superglobals: a new scope's $_SERVER starts as a copy of its creator's, environment entries included
+Superglobals: a new scope's $_SERVER starts empty, environment entries included; the root keeps the SAPI's
 --EXTENSIONS--
 scope
 --FILE--
@@ -7,14 +7,19 @@ scope
 // "argv" comes from the SAPI (the environment), not from anything this script set.
 var_dump(isset($_SERVER["argv"]));
 $s = new Scope();
-$_SERVER["late"] = 1; // after creation: the child must not see it
-echo $s->run(function () { return json_encode(["argv" => isset($_SERVER["argv"]), "late" => isset($_SERVER["late"])]); }), "\n";
+echo $s->run(function () { return json_encode($_SERVER); }), "
+";
 $s->run(function () { $_SERVER["child"] = 1; });
-echo json_encode(["child" => isset($_SERVER["child"])]), "\n";
-// a grandchild inherits from its creator scope, not from the root
-$s->run(function () { $g = new Scope(); echo json_encode($g->run(fn() => ["argv" => isset($_SERVER["argv"]), "late" => isset($_SERVER["late"]), "child" => isset($_SERVER["child"])])), "\n"; });
+echo json_encode(["child" => isset($_SERVER["child"]), "argv" => isset($_SERVER["argv"])]), "
+";
+// a grandchild starts empty too, not with its creator's
+$s->run(function () { $g = new Scope(); echo json_encode($g->run(fn() => $_SERVER)), "
+"; });
+echo json_encode($s->run(fn() => $_SERVER)), "
+";
 --EXPECT--
 bool(true)
-{"argv":true,"late":false}
-{"child":false}
-{"argv":true,"late":false,"child":true}
+[]
+{"child":false,"argv":true}
+[]
+{"child":1}

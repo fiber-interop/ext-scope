@@ -29,6 +29,7 @@
 #include "ext/standard/info.h"
 #include "SAPI.h"
 #include "main/php_globals.h"
+#include "zend_closures.h"
 #include "zend_exceptions.h"
 #include "zend_extensions.h"
 #include "zend_fibers.h"
@@ -37,9 +38,10 @@
 #include "zend_weakrefs.h"
 #include "ext/json/php_json.h"
 #include "ext/date/php_date.h"
+#include "ext/session/php_session.h"
 #include "scope_arginfo.h"
 
-#define PHP_SCOPE_VERSION "0.3.1"
+#define PHP_SCOPE_VERSION "0.4.0"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -123,12 +125,43 @@ typedef struct {
 	bool ready;
 } scope_tl;
 
+/* ext/session's per-request state of a scope that is not the applied one (secondary vote A):
+ * what ext/session's RINIT/RSHUTDOWN reset, plus the session ini entries a request changes
+ * through session_name(), session_save_path(), session_set_cookie_params() and
+ * session_cache_limiter()/session_cache_expire(). */
+#define SCOPE_SESS_INI_N 11
+typedef struct {
+	zend_string *id;
+	php_session_status status;
+	const ps_module *mod;
+	void *mod_data;
+	__typeof__(((php_ps_globals *) 0)->mod_user_names) user_names;
+	bool user_implemented;
+	bool user_is_open;
+	zend_string *user_class_name;
+#if PHP_VERSION_ID >= 80600
+	bool user_obj_methods;
+#endif
+	zend_string *vars;
+	zval http_vars;
+	bool send_cookie;
+	bool define_sid;
+	bool in_save_handler;
+	bool set_handler;
+#if PHP_VERSION_ID >= 80300
+	zend_string *started_file;
+	uint32_t started_line;
+#endif
+	zend_string *ini[SCOPE_SESS_INI_N];
+} scope_sess;
+
 /* A Scope object, with its swapped globals and its slots (both allocated on first use). */
 typedef struct {
 	char *state;
 	void **slots;
 	zval *sg;   /* the six request superglobals while this scope is not the applied one (NULL: not tracked) */
 	scope_tl tl; /* the default timezone and locale while this scope is not the applied one */
+	scope_sess *sess; /* its session while this scope is not the applied one (NULL: not tracked) */
 	zend_object std;
 } scope_object;
 
@@ -142,8 +175,12 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	bool slot_demo;         /* INI scope.slot_demo */
 	bool superglobals;      /* INI scope.superglobals */
 	bool locale_timezone;   /* INI scope.locale_timezone */
+	bool session;           /* INI scope.session */
+	scope_sess root_sess;   /* the root scope's session while another scope is applied */
+	HashTable bound;        /* the data of the closures Scope::bind() returned */
 	scope_tl root_tl;       /* the root scope's timezone and locale while another scope is applied */
 	zend_ini_entry *loc_ini; /* intl.default_locale; NULL when intl is not loaded */
+	zend_string *loc_initial; /* the locale a new scope starts with: the ini value, or ICU's default at RINIT if unset */
 	zval root_sg[SCOPE_SG_N]; /* the root scope's request superglobals while another scope is applied */
 	char *root_state;       /* the globals' own state while a scope's is applied */
 	bool active;            /* between RINIT and RSHUTDOWN */
@@ -279,18 +316,16 @@ static zval *scope_sg_live(int i)
 	return z;
 }
 
-/* A new scope's own arrays: references to the creating scope's (copy-on-write). */
-static zval *scope_sg_snapshot(void)
+/* A new scope's own arrays: empty, as a server's request starts before it seeds them. The
+ * live entries are looked up anyway, so the first scope creation forces the lazily
+ * created auto-globals (a later JIT callback would otherwise overwrite a scope's array). */
+static zval *scope_sg_new(void)
 {
 	zval *sg = ecalloc(SCOPE_SG_N, sizeof(zval));
 
 	for (int i = 0; i < SCOPE_SG_N; i++) {
-		zval *live = scope_sg_live(i);
-		if (live != NULL) {
-			ZVAL_COPY_DEREF(&sg[i], live);
-		} else {
-			array_init(&sg[i]);
-		}
+		scope_sg_live(i);
+		array_init(&sg[i]);
 	}
 	return sg;
 }
@@ -365,11 +400,38 @@ static void scope_tl_save(scope_tl *t)
 	t->ready = true;
 }
 
-/* A new scope inherits the live values, which are its creator's. */
-static void scope_tl_inherit(scope_tl *t)
+/* A new scope starts with the ini values: no timezone of its own (the date.timezone ini,
+ * or its fallback) and the ini value of intl.default_locale, not its creator's. */
+static void scope_tl_init(scope_tl *t)
 {
 	memset(t, 0, sizeof(*t));
-	scope_tl_save(t);
+	if (SCOPE_G(loc_initial)) {
+		t->loc = zend_string_copy(SCOPE_G(loc_initial));
+	}
+	t->ready = true;
+}
+
+/* RINIT: the locale a new scope starts with. intl.default_locale unset means ICU's process
+ * default, which Locale::setDefault() also changes; take its value before any code runs. */
+static void scope_tl_startup(void)
+{
+	zend_ini_entry *e = SCOPE_G(loc_ini);
+
+	SCOPE_G(loc_initial) = NULL;
+	if (e == NULL) {
+		return;
+	}
+	if (e->value && ZSTR_LEN(e->value)) {
+		SCOPE_G(loc_initial) = zend_string_copy(e->value);
+	} else {
+		zval fn, rv;
+		ZVAL_STRINGL(&fn, "locale_get_default", sizeof("locale_get_default") - 1);
+		if (call_user_function(NULL, NULL, &fn, &rv, 0, NULL) == SUCCESS && Z_TYPE(rv) == IS_STRING) {
+			SCOPE_G(loc_initial) = zend_string_copy(Z_STR(rv));
+		}
+		zval_ptr_dtor(&rv);
+		zval_ptr_dtor(&fn);
+	}
 }
 
 /* Swap the live values with a scope's: the timezone is a pointer swap (the holder owns its
@@ -399,8 +461,179 @@ static void scope_tl_swap(scope_tl *from, scope_tl *to)
 		}
 		if (want && (live == NULL || !zend_string_equals(want, live))) {
 			zend_alter_ini_entry(SCOPE_G(loc_ini)->name, want, PHP_INI_USER, PHP_INI_STAGE_RUNTIME);
+		} else if (want == NULL && live != NULL) {
+			zend_restore_ini_entry(SCOPE_G(loc_ini)->name, PHP_INI_STAGE_RUNTIME);   /* back to the ini value (unset) */
 		}
 	}
+}
+
+/* ---- the session (secondary vote A) ----------------------------------------
+ *
+ * ext/session's per-request globals (the PS() fields its RINIT/RSHUTDOWN reset) are moved
+ * between the live globals and the scope's storage at every switch, the way the phasync
+ * extension's sapi() swaps them per request. ext/session is optional: scope_ps is NULL
+ * without it (or on ZTS builds), and nothing is swapped. The ini-backed settings a request
+ * changes at runtime (session_name(), session_set_cookie_params(), ...) are swapped as the
+ * ini entries' values, re-applied through the entry's own handler when they differ. */
+
+static php_ps_globals *scope_ps;
+static const char *const scope_sess_ini_names[SCOPE_SESS_INI_N] = {
+	"session.name", "session.save_path", "session.cache_limiter", "session.cache_expire",
+	"session.cookie_lifetime", "session.cookie_path", "session.cookie_domain", "session.cookie_secure",
+	"session.cookie_httponly", "session.cookie_samesite", "session.cookie_partitioned",
+};
+static zend_ini_entry *scope_sess_ini[SCOPE_SESS_INI_N];
+
+#define SCOPE_SESS_ON() (SCOPE_G(session) && scope_ps != NULL)
+
+#if PHP_VERSION_ID >= 80600
+# define SCOPE_SESS_OBJMETHODS(X) X(user_obj_methods, mod_user_uses_object_methods_as_handlers)
+#else
+# define SCOPE_SESS_OBJMETHODS(X)
+#endif
+#if PHP_VERSION_ID >= 80300
+# define SCOPE_SESS_STARTED(X) X(started_file, session_started_filename) X(started_line, session_started_lineno)
+#else
+# define SCOPE_SESS_STARTED(X)
+#endif
+#define SCOPE_SESS_FIELDS(X) \
+	X(id, id) X(status, session_status) X(mod, mod) X(mod_data, mod_data) \
+	X(user_names, mod_user_names) X(user_implemented, mod_user_implemented) \
+	X(user_is_open, mod_user_is_open) X(user_class_name, mod_user_class_name) SCOPE_SESS_OBJMETHODS(X) \
+	X(vars, session_vars) X(http_vars, http_session_vars) X(send_cookie, send_cookie) \
+	X(define_sid, define_sid) X(in_save_handler, in_save_handler) X(set_handler, set_handler) \
+	SCOPE_SESS_STARTED(X)
+
+/* The ini value a new request starts with. */
+static zend_string *scope_ini_initial(zend_ini_entry *e)
+{
+	return e->modified ? e->orig_value : e->value;
+}
+
+/* A new scope's session state: none started, the save handler of the session.save_handler ini. */
+static scope_sess *scope_sess_new(void)
+{
+	scope_sess *ss = ecalloc(1, sizeof(scope_sess));
+	zend_ini_entry *h = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("session.save_handler"));
+	zend_string *hv = h ? scope_ini_initial(h) : NULL;
+
+	ss->mod = hv ? _php_find_ps_module(ZSTR_VAL(hv)) : NULL;
+	ss->status = ss->mod ? php_session_none : php_session_disabled;
+	ss->define_sid = true;
+	ZVAL_UNDEF(&ss->http_vars);
+	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
+		zend_string *v = scope_sess_ini[i] ? scope_ini_initial(scope_sess_ini[i]) : NULL;
+		ss->ini[i] = v ? zend_string_copy(v) : NULL;
+	}
+	return ss;
+}
+
+/* Release what a stored (not applied) session state owns; its session is already closed. */
+static void scope_sess_free(scope_sess *ss)
+{
+	zval *names = (zval *) &ss->user_names;
+
+	if (ss->id) zend_string_release(ss->id);
+	if (ss->vars) zend_string_release(ss->vars);
+	if (ss->user_class_name) zend_string_release(ss->user_class_name);
+#if PHP_VERSION_ID >= 80300
+	if (ss->started_file) zend_string_release(ss->started_file);
+#endif
+	zval_ptr_dtor(&ss->http_vars);
+	for (size_t i = 0; i < sizeof(ss->user_names) / sizeof(zval); i++) {
+		zval_ptr_dtor(&names[i]);
+	}
+	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
+		if (ss->ini[i]) zend_string_release(ss->ini[i]);
+	}
+	memset(ss, 0, sizeof(*ss));
+}
+
+/* Move the live session state into from and to's into the live globals (to is left empty). */
+static void scope_sess_swap(scope_sess *from, scope_sess *to)
+{
+	php_session_status status;
+	zval *sym;
+
+#define SCOPE_SESS_MOVE(f, g) from->f = scope_ps->g; scope_ps->g = to->f;
+	SCOPE_SESS_FIELDS(SCOPE_SESS_MOVE)
+#undef SCOPE_SESS_MOVE
+
+	/* The ini entries. The handlers refuse changes while a session is active, so the status
+	 * is "none" while they run; the stage skips their headers-sent check. */
+	status = scope_ps->session_status;
+	scope_ps->session_status = php_session_none;
+	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
+		zend_ini_entry *e = scope_sess_ini[i];
+		zend_string *live, *want = to->ini[i];
+
+		if (e == NULL) {
+			from->ini[i] = NULL;
+			continue;
+		}
+		live = e->value;
+		if (want == NULL) {
+			from->ini[i] = live ? zend_string_copy(live) : NULL;
+		} else if (live && (want == live || zend_string_equals(want, live))) {
+			from->ini[i] = want;   /* same value: the globals keep pointing at the live one */
+		} else {
+			if (e->on_modify) {
+				e->on_modify(e, want, e->mh_arg1, e->mh_arg2, e->mh_arg3, ZEND_INI_STAGE_DEACTIVATE);
+			}
+			e->value = want;
+			from->ini[i] = live;
+		}
+	}
+	scope_ps->session_status = status;
+	memset(to, 0, sizeof(*to));
+	ZVAL_UNDEF(&to->http_vars);
+
+	/* $_SESSION is ext/session's own symbol-table zval sharing http_session_vars' reference;
+	 * keep the two together, as session_start() does. Without a "_SESSION" entry, the next
+	 * session_start() creates it. While neither scope has session data, $_SESSION is an
+	 * ordinary global and is left alone. */
+	sym = zend_hash_str_find(&EG(symbol_table), ZEND_STRL("_SESSION"));
+	if (sym && (!Z_ISUNDEF(from->http_vars) || !Z_ISUNDEF(scope_ps->http_session_vars))) {
+		zval old;
+
+		if (Z_TYPE_P(sym) == IS_INDIRECT) {
+			sym = Z_INDIRECT_P(sym);
+		}
+		old = *sym;
+		if (Z_ISUNDEF(scope_ps->http_session_vars)) {
+			ZVAL_NULL(sym);
+		} else {
+			ZVAL_COPY(sym, &scope_ps->http_session_vars);
+		}
+		zval_ptr_dtor(&old);
+	}
+}
+
+/* The end of a scope's session, as ext/session's RSHUTDOWN ends a request's: write and close
+ * an active session, then free the state. The scope must not be the applied one. */
+static void scope_sess_end(scope_sess *ss)
+{
+	scope_sess live;
+
+	if (ss->status == php_session_active || ss->mod_data || ss->user_implemented) {
+		scope_sess_swap(&live, ss);
+		if (scope_ps->session_status == php_session_active) {
+			zend_try {
+				php_session_flush(1);
+			} zend_end_try();
+		}
+		zval_ptr_dtor(&scope_ps->http_session_vars);
+		ZVAL_UNDEF(&scope_ps->http_session_vars);
+		if (scope_ps->mod && (scope_ps->mod_data || scope_ps->mod_user_implemented)) {
+			zend_try {
+				scope_ps->mod->s_close(&scope_ps->mod_data);
+			} zend_end_try();
+		}
+		scope_ps->mod_data = NULL;
+		scope_ps->session_status = php_session_none;
+		scope_sess_swap(ss, &live);
+	}
+	scope_sess_free(ss);
 }
 
 /* Make the globals hold the state of the scope that is current now. Called
@@ -431,6 +664,14 @@ static void scope_apply(void)
 			 * the ini is off; nothing to swap */
 		} else {
 			scope_sg_swap(from, to);
+		}
+	}
+	if (SCOPE_G(superglobals) && SCOPE_SESS_ON()) {
+		scope_sess *from = SCOPE_G(applied) ? SCOPE_OBJECT(SCOPE_G(applied))->sess : &SCOPE_G(root_sess);
+		scope_sess *to = want ? SCOPE_OBJECT(want)->sess : &SCOPE_G(root_sess);
+
+		if (from && to) {
+			scope_sess_swap(from, to);
 		}
 	}
 	if (SCOPE_G(locale_timezone)) {
@@ -868,6 +1109,8 @@ static void scope_op_array_handler(zend_op_array *op_array)
 	efree(at);
 }
 
+static int scope_bound_handle = -1;   /* reserved[] slot of the functions Scope::bind() creates */
+
 static zend_extension scope_zend_extension = {
 	.name = "scope",
 	.version = PHP_SCOPE_VERSION,
@@ -913,6 +1156,7 @@ static void scope_generator_switches_startup(void)
 	}
 #endif
 	zend_register_extension(&scope_zend_extension, NULL);
+	scope_bound_handle = zend_get_resource_handle(scope_zend_extension.name);
 	scope_compile_string_orig = zend_compile_string;
 	zend_compile_string = scope_compile_string;
 }
@@ -1068,10 +1312,13 @@ static zend_object *scope_create(zend_class_entry *ce)
 	object_properties_init(&so->std, ce);
 	so->std.handlers = &scope_handlers;
 	if (SCOPE_G(superglobals) && SCOPE_G(active)) {
-		so->sg = scope_sg_snapshot();
+		so->sg = scope_sg_new();
 	}
 	if (SCOPE_G(locale_timezone) && SCOPE_G(active)) {
-		scope_tl_inherit(&so->tl);
+		scope_tl_init(&so->tl);
+	}
+	if (SCOPE_G(superglobals) && SCOPE_SESS_ON() && SCOPE_G(active)) {
+		so->sess = scope_sess_new();
 	}
 	return &so->std;
 }
@@ -1085,6 +1332,14 @@ static void scope_free(zend_object *obj)
 	scope_slots_free(so->slots);
 	scope_sg_free(so->sg);
 	scope_tl_free(&so->tl);
+	if (so->sess) {
+		if (SCOPE_G(active) && SCOPE_G(applied) != obj) {
+			scope_sess_end(so->sess);   /* destroyed with its session still active: write and close it */
+		} else {
+			scope_sess_free(so->sess);
+		}
+		efree(so->sess);
+	}
 	if (so->state) {
 		for (size_t i = 0; i < scope_states_n; i++) {
 			if (scope_states[i].destroy) {
@@ -1108,6 +1363,11 @@ static zend_object *scope_root(void)
 		scope_sg_free(SCOPE_OBJECT(Z_OBJ(z))->sg);
 		SCOPE_OBJECT(Z_OBJ(z))->sg = NULL;
 		scope_tl_free(&SCOPE_OBJECT(Z_OBJ(z))->tl);
+		if (SCOPE_OBJECT(Z_OBJ(z))->sess) {
+			scope_sess_free(SCOPE_OBJECT(Z_OBJ(z))->sess);
+			efree(SCOPE_OBJECT(Z_OBJ(z))->sess);
+			SCOPE_OBJECT(Z_OBJ(z))->sess = NULL;
+		}
 		SCOPE_G(root) = Z_OBJ(z);
 	}
 	return SCOPE_G(root);
@@ -1127,22 +1387,17 @@ ZEND_METHOD(Scope, __construct)
 	ZEND_PARSE_PARAMETERS_NONE();
 }
 
-ZEND_METHOD(Scope, run)
+/* Call fci with scope current (NULL or the root object: the root), as run() does: the scope
+ * is restored when the call returns, throws or bails out. */
+static void scope_call_in(zend_object *scope, zend_fcall_info *fci, zend_fcall_info_cache *fcc)
 {
-	zend_fcall_info fci;
-	zend_fcall_info_cache fcc;
 	zend_array *a = SCOPE_G(cur);
 	zval *current, saved;
 	bool bailout = false;
 
-	ZEND_PARSE_PARAMETERS_START(1, -1)
-		Z_PARAM_FUNC(fci, fcc)
-		Z_PARAM_VARIADIC_WITH_NAMED(fci.params, fci.param_count, fci.named_params)
-	ZEND_PARSE_PARAMETERS_END();
-
 	if (a == NULL) {
 		zend_throw_error(NULL, "Scope::run() is not available during shutdown");
-		RETURN_THROWS();
+		return;
 	}
 
 	/* Push the current scope and make this one current. The array is the running
@@ -1151,16 +1406,15 @@ ZEND_METHOD(Scope, run)
 	current = scope_current(a);
 	ZVAL_COPY_VALUE(&saved, current);
 	zend_hash_next_index_insert_new(a, &saved);
-	if (Z_OBJ_P(ZEND_THIS) == SCOPE_G(root)) {
+	if (scope == NULL || scope == SCOPE_G(root)) {
 		ZVAL_NULL(scope_current(a));
 	} else {
-		ZVAL_OBJ_COPY(scope_current(a), Z_OBJ_P(ZEND_THIS));
+		ZVAL_OBJ_COPY(scope_current(a), scope);
 	}
 	scope_apply();
 
-	fci.retval = return_value;
 	zend_try {
-		zend_call_function(&fci, &fcc);
+		zend_call_function(fci, fcc);
 	} zend_catch {
 		bailout = true;
 	} zend_end_try();
@@ -1181,6 +1435,165 @@ ZEND_METHOD(Scope, run)
 	if (bailout) {
 		zend_bailout();
 	}
+}
+
+ZEND_METHOD(Scope, run)
+{
+	zend_fcall_info fci;
+	zend_fcall_info_cache fcc;
+
+	ZEND_PARSE_PARAMETERS_START(1, -1)
+		Z_PARAM_FUNC(fci, fcc)
+		Z_PARAM_VARIADIC_WITH_NAMED(fci.params, fci.param_count, fci.named_params)
+	ZEND_PARSE_PARAMETERS_END();
+
+	fci.retval = return_value;
+	scope_call_in(Z_OBJ_P(ZEND_THIS), &fci, &fcc);
+}
+
+/* ---- Scope::bind() ----------------------------------------------------------
+ *
+ * The returned closure is an internal function whose arg_info is the original closure's own
+ * (ZEND_ACC_USER_ARG_INFO, as for Closure::__invoke), so its signature, by-reference
+ * parameters, defaults and return type are the original's, and the engine passes by-reference
+ * arguments as references. Its handler calls the original closure, which keeps its own $this
+ * and class scope, through scope_call_in(). The scope and the original closure are held by a
+ * scope_bound found through a reserved slot of the function; copies of the closure
+ * (Closure::bind(), clone) share it, so it is freed with the last copy that has our handlers
+ * when no other copy holds the function name, and otherwise at the end of the request. */
+
+typedef struct {
+	zend_object *scope;
+	zval closure;
+} scope_bound;
+
+static zend_object_handlers scope_bound_handlers;
+static void (*scope_closure_free_orig)(zend_object *obj);
+
+static void scope_bound_dtor(zval *zv)
+{
+	scope_bound *b = Z_PTR_P(zv);
+
+	OBJ_RELEASE(b->scope);
+	zval_ptr_dtor(&b->closure);
+	efree(b);
+}
+
+static void scope_bound_free(zend_object *obj)
+{
+	const zend_function *f = zend_get_closure_method_def(obj);
+
+	if (SCOPE_G(active) && GC_REFCOUNT(f->common.function_name) == 1) {
+		zend_hash_index_del(&SCOPE_G(bound), (zend_ulong) (uintptr_t) f->internal_function.reserved[scope_bound_handle]);
+	}
+	scope_closure_free_orig(obj);
+}
+
+static ZEND_NAMED_FUNCTION(scope_bound_call)
+{
+	scope_bound *b = EX(func)->internal_function.reserved[scope_bound_handle];
+	uint32_t n = ZEND_CALL_NUM_ARGS(execute_data), pos = n;
+	zval *args = ZEND_CALL_ARG(execute_data, 1);
+	HashTable *named = (ZEND_CALL_INFO(execute_data) & ZEND_CALL_HAS_EXTRA_NAMED_PARAMS) ? execute_data->extra_named_params : NULL;
+	HashTable *tmp = NULL;
+	zend_fcall_info fci;
+	zend_fcall_info_cache fcc;
+
+	if (!SCOPE_G(active) || zend_hash_index_find_ptr(&SCOPE_G(bound), (zend_ulong) (uintptr_t) b) != b) {
+		zend_throw_error(NULL, "The scope of a closure returned by Scope::bind() is gone");
+		return;
+	}
+	/* Named arguments that skip optional parameters leave holes: pass what follows by name. */
+	for (uint32_t i = 0; i < n; i++) {
+		if (Z_ISUNDEF(args[i])) {
+			pos = i;
+			break;
+		}
+	}
+	if (pos < n) {
+		const zend_arg_info *ai = (const zend_arg_info *) EX(func)->common.arg_info;
+
+		tmp = zend_new_array(n);
+		if (named) {
+			zend_hash_copy(tmp, named, zval_add_ref);
+		}
+		for (uint32_t i = pos; i < n; i++) {
+			if (!Z_ISUNDEF(args[i])) {
+				Z_TRY_ADDREF(args[i]);
+				zend_hash_update(tmp, ai[i].name, &args[i]);
+			}
+		}
+		named = tmp;
+	}
+	if (zend_fcall_info_init(&b->closure, 0, &fci, &fcc, NULL, NULL) == SUCCESS) {
+		fci.params = args;
+		fci.param_count = pos;
+		fci.named_params = named;
+		fci.retval = return_value;
+		scope_call_in(b->scope, &fci, &fcc);
+	}
+	if (tmp) {
+		zend_array_release(tmp);
+	}
+}
+
+ZEND_METHOD(Scope, bind)
+{
+	zval *closure, this_zv;
+	zend_object *cobj, *this_obj = NULL;
+	zend_class_entry *called_scope = NULL;
+	zend_function *fptr = NULL;
+	const zend_function *orig;
+	zend_internal_function f;
+	scope_bound *b;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_OBJECT_OF_CLASS(closure, zend_ce_closure)
+	ZEND_PARSE_PARAMETERS_END();
+
+	cobj = Z_OBJ_P(closure);
+	orig = zend_get_closure_method_def(cobj);
+	/* Binding a closure bind() returned replaces its scope: bind the original one. */
+	if (orig->type == ZEND_INTERNAL_FUNCTION && orig->internal_function.reserved[scope_bound_handle]) {
+		scope_bound *prev = orig->internal_function.reserved[scope_bound_handle];
+		if (zend_hash_index_find_ptr(&SCOPE_G(bound), (zend_ulong) (uintptr_t) prev) == prev) {
+			cobj = Z_OBJ(prev->closure);
+			orig = zend_get_closure_method_def(cobj);
+		}
+	}
+	cobj->handlers->get_closure(cobj, &called_scope, &fptr, &this_obj, false);
+
+	memset(&f, 0, sizeof(f));
+	f.type = ZEND_INTERNAL_FUNCTION;
+	memcpy(f.arg_flags, orig->common.arg_flags, sizeof(f.arg_flags));   /* the by-reference send modes */
+	f.fn_flags = ZEND_ACC_PUBLIC | ZEND_ACC_USER_ARG_INFO
+		| (orig->common.fn_flags & (ZEND_ACC_STATIC | ZEND_ACC_VARIADIC | ZEND_ACC_HAS_RETURN_TYPE));
+	f.function_name = zend_string_init(ZSTR_VAL(orig->common.function_name), ZSTR_LEN(orig->common.function_name), 0);
+	f.scope = orig->common.scope;
+	f.num_args = orig->common.num_args;
+	f.required_num_args = orig->common.required_num_args;
+	f.arg_info = (zend_internal_arg_info *) orig->common.arg_info;
+	f.handler = scope_bound_call;
+
+	b = emalloc(sizeof(scope_bound));
+	b->scope = Z_OBJ_P(ZEND_THIS);
+	GC_ADDREF(b->scope);
+	ZVAL_OBJ_COPY(&b->closure, cobj);
+	f.reserved[scope_bound_handle] = b;
+	zend_hash_index_add_new_ptr(&SCOPE_G(bound), (zend_ulong) (uintptr_t) b, b);
+
+	if (this_obj) {
+		ZVAL_OBJ(&this_zv, this_obj);
+	}
+	zend_create_closure(return_value, (zend_function *) &f, f.scope, called_scope, this_obj ? &this_zv : NULL);
+	zend_string_release(f.function_name);
+
+	if (scope_closure_free_orig == NULL) {
+		memcpy(&scope_bound_handlers, Z_OBJ_P(return_value)->handlers, sizeof(zend_object_handlers));
+		scope_closure_free_orig = scope_bound_handlers.free_obj;
+		scope_bound_handlers.free_obj = scope_bound_free;
+	}
+	Z_OBJ_P(return_value)->handlers = &scope_bound_handlers;
 }
 
 ZEND_METHOD(Scope, getCurrent)
@@ -1298,6 +1711,8 @@ PHP_INI_BEGIN()
 		superglobals, zend_scope_globals, scope_globals)
 	STD_PHP_INI_BOOLEAN("scope.locale_timezone", "1", PHP_INI_SYSTEM, OnUpdateBool,
 		locale_timezone, zend_scope_globals, scope_globals)
+	STD_PHP_INI_BOOLEAN("scope.session", "1", PHP_INI_SYSTEM, OnUpdateBool,
+		session, zend_scope_globals, scope_globals)
 	STD_PHP_INI_BOOLEAN("scope.slot_demo", "0", PHP_INI_SYSTEM, OnUpdateBool,
 		slot_demo, zend_scope_globals, scope_globals)
 PHP_INI_END()
@@ -1318,6 +1733,18 @@ static PHP_MINIT_FUNCTION(scope)
 		return FAILURE;
 	}
 	SCOPE_G(loc_ini) = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("intl.default_locale"));
+#ifndef ZTS
+	{
+		zend_module_entry *session = zend_hash_str_find_ptr(&module_registry, ZEND_STRL("session"));
+		if (session && session->globals_size == sizeof(php_ps_globals)) {
+			scope_ps = session->globals_ptr;
+			for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
+				scope_sess_ini[i] = zend_hash_str_find_ptr(EG(ini_directives),
+					scope_sess_ini_names[i], strlen(scope_sess_ini_names[i]));
+			}
+		}
+	}
+#endif
 	scope_ce = register_class_Scope();
 	memcpy(&scope_handlers, &std_object_handlers, sizeof(zend_object_handlers));
 	scope_handlers.offset = XtOffsetOf(scope_object, std);
@@ -1383,8 +1810,11 @@ static PHP_RINIT_FUNCTION(scope)
 	SCOPE_G(gen_last) = NULL;
 	memset(SCOPE_G(root_sg), 0, sizeof(SCOPE_G(root_sg)));
 	memset(&SCOPE_G(root_tl), 0, sizeof(SCOPE_G(root_tl)));
+	memset(&SCOPE_G(root_sess), 0, sizeof(SCOPE_G(root_sess)));
+	zend_hash_init(&SCOPE_G(bound), 8, NULL, scope_bound_dtor, 0);
 	if (SCOPE_G(locale_timezone)) {
 		scope_tl_save(&SCOPE_G(root_tl));
+		scope_tl_startup();
 	}
 	SCOPE_G(applied) = NULL;
 	SCOPE_G(cur_scope) = NULL;
@@ -1403,11 +1833,27 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 	zval_ptr_dtor(scope_current(SCOPE_G(cur)));
 	ZVAL_NULL(scope_current(SCOPE_G(cur)));
 	scope_apply();
+	if (SCOPE_G(superglobals) && SCOPE_SESS_ON()) {
+		/* scopes still alive: their sessions end with the request, before ext/session's own RSHUTDOWN */
+		for (uint32_t i = 1; i < EG(objects_store).top; i++) {
+			zend_object *obj = EG(objects_store).object_buckets[i];
+			if (IS_OBJ_VALID(obj) && obj->ce == scope_ce && SCOPE_OBJECT(obj)->sess) {
+				scope_sess_end(SCOPE_OBJECT(obj)->sess);
+				efree(SCOPE_OBJECT(obj)->sess);
+				SCOPE_OBJECT(obj)->sess = NULL;
+			}
+		}
+	}
+	zend_hash_destroy(&SCOPE_G(bound));
 	if (SCOPE_G(root_state)) {
 		efree(SCOPE_G(root_state));
 		SCOPE_G(root_state) = NULL;
 	}
 	scope_tl_free(&SCOPE_G(root_tl));
+	if (SCOPE_G(loc_initial)) {
+		zend_string_release(SCOPE_G(loc_initial));
+		SCOPE_G(loc_initial) = NULL;
+	}
 	scope_slots_free(SCOPE_G(root_slots));
 	SCOPE_G(root_slots) = NULL;
 	SCOPE_G(active) = false;
@@ -1438,6 +1884,7 @@ static PHP_MINFO_FUNCTION(scope)
 static const zend_module_dep scope_deps[] = {
 	ZEND_MOD_REQUIRED("date")
 	ZEND_MOD_OPTIONAL("intl")
+	ZEND_MOD_OPTIONAL("session")
 	ZEND_MOD_END
 };
 
