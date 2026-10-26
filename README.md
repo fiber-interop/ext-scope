@@ -129,20 +129,26 @@ When ext/session is loaded (it is an optional dependency), its request state fol
   (`session_set_save_handler()`: the handler callables, class name, open/implemented flags), the serialized original
   data (`session_vars`), `send_cookie`, `define_sid`, `in_save_handler`, `set_handler` and the "started at" file and
   line. These are the `PS()` globals ext/session's RINIT and RSHUTDOWN reset; phasync's `sapi()` swaps the same set.
-- Also swapped, as ini values re-applied through the entries' own handlers when two scopes differ: `session.name`,
-  `session.save_path`, `session.cache_limiter`, `session.cache_expire` and the `session.cookie_*` entries (lifetime,
-  path, domain, secure, httponly, samesite, partitioned), that is what `session_name()`, `session_save_path()`,
-  `session_set_cookie_params()` and `session_cache_limiter()`/`session_cache_expire()` change.
-- A new scope has no session (`PHP_SESSION_NONE`), the ini values of those entries, and the save handler of the
-  `session.save_handler` ini (not a handler the creator set with `session_set_save_handler()`).
+- Not swapped: the session's settings. The `session.*` ini entries, and `session_name()`, `session_save_path()`,
+  `session_set_cookie_params()` and `session_cache_limiter()`/`session_cache_expire()` that write them, stay
+  request-wide, as `ini_set()` does. A started session can't have them changed (ext/session refuses while it is
+  active), but a scope without an active session can change them for the whole request, so a started session that
+  reads them again (`session_regenerate_id()`, the getters) sees the request's current values.
+- A new scope has no session (`PHP_SESSION_NONE`) and the save handler of the current `session.save_handler` setting
+  (not a handler the creator set with `session_set_save_handler()`).
 - `session_start()` inside a scope starts that scope's session; all its fibers and generators share it.
 - A scope destroyed with its session active writes and closes it, as request end does. This happens in the
   destructor phase, so a user save handler's `write()` and `close()` run as a destructor would: when the last
   reference goes, before `gc_collect_cycles()` frees a cycle the scope is in, or at request shutdown for scopes
   still alive, before ext/session's own shutdown handles the root's. An exception from the handler propagates as one
   from a destructor. `Scope` reports its superglobals, `$_SESSION` and save handler to the cycle collector.
-- Not swapped: other session ini entries (`session.save_handler`, `session.serialize_handler`, `use_*`, gc settings)
-  stay request-wide.
+
+- **Locking handlers block the process.** The files handler holds an `flock()` on the session file while the session
+  is open, and other handlers (memcached, redis) lock too. Two scopes in one process that open the same session id
+  at once (a browser's parallel requests do) deadlock: the second `session_start()` waits for a lock only the first
+  scope can release, and that scope can't run while the process waits. Under php-fpm or ZTS the second request
+  waits in its own process or thread instead. A server that runs requests as scopes needs a handler that waits
+  cooperatively, or must not open the same session id in two scopes at once.
 
 `scope.session` (default `1`, `PHP_INI_SYSTEM`) turns only this off; it is also off when `scope.superglobals=0`.
 The session is not swapped on ZTS builds.

@@ -126,10 +126,8 @@ typedef struct {
 } scope_tl;
 
 /* ext/session's per-request state of a scope that is not the applied one (secondary vote A):
- * what ext/session's RINIT/RSHUTDOWN reset, plus the session ini entries a request changes
- * through session_name(), session_save_path(), session_set_cookie_params() and
- * session_cache_limiter()/session_cache_expire(). */
-#define SCOPE_SESS_INI_N 11
+ * what ext/session's RINIT/RSHUTDOWN reset. Its settings (the session.* ini entries) are not
+ * part of it: they stay request-wide. */
 typedef struct {
 	zend_string *id;
 	php_session_status status;
@@ -153,7 +151,6 @@ typedef struct {
 	zend_string *started_file;
 	uint32_t started_line;
 #endif
-	zend_string *ini[SCOPE_SESS_INI_N];
 } scope_sess;
 
 /* A Scope object, with its swapped globals and its slots (both allocated on first use). */
@@ -484,17 +481,11 @@ static void scope_tl_swap(scope_tl *from, scope_tl *to)
  * ext/session's per-request globals (the PS() fields its RINIT/RSHUTDOWN reset) are moved
  * between the live globals and the scope's storage at every switch, the way the phasync
  * extension's sapi() swaps them per request. ext/session is optional: scope_ps is NULL
- * without it (or on ZTS builds), and nothing is swapped. The ini-backed settings a request
- * changes at runtime (session_name(), session_set_cookie_params(), ...) are swapped as the
- * ini entries' values, re-applied through the entry's own handler when they differ. */
+ * without it (or on ZTS builds), and nothing is swapped. The session is isolated, its
+ * settings are not: the session.* ini entries, and session_name(), session_set_cookie_params()
+ * and the others that write them, stay request-wide, as ini_set() does. */
 
 static php_ps_globals *scope_ps;
-static const char *const scope_sess_ini_names[SCOPE_SESS_INI_N] = {
-	"session.name", "session.save_path", "session.cache_limiter", "session.cache_expire",
-	"session.cookie_lifetime", "session.cookie_path", "session.cookie_domain", "session.cookie_secure",
-	"session.cookie_httponly", "session.cookie_samesite", "session.cookie_partitioned",
-};
-static zend_ini_entry *scope_sess_ini[SCOPE_SESS_INI_N];
 
 #define SCOPE_SESS_ON() (SCOPE_G(session) && scope_ps != NULL)
 
@@ -517,27 +508,18 @@ static zend_ini_entry *scope_sess_ini[SCOPE_SESS_INI_N];
 	SCOPE_SESS_STARTED(X)
 
 /* The ini value a new request starts with. */
-static zend_string *scope_ini_initial(zend_ini_entry *e)
-{
-	return e->modified ? e->orig_value : e->value;
-}
-
 /* A new scope's session state: none started, the save handler of the session.save_handler ini. */
 static scope_sess *scope_sess_new(void)
 {
 	scope_sess *ss = ecalloc(1, sizeof(scope_sess));
 	zend_ini_entry *h = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("session.save_handler"));
-	zend_string *hv = h ? scope_ini_initial(h) : NULL;
+	zend_string *hv = h ? h->value : NULL;   /* the request's current setting: ini_set() of it is request-wide */
 
 	ss->mod = hv ? _php_find_ps_module(ZSTR_VAL(hv)) : NULL;
 	ss->status = ss->mod ? php_session_none : php_session_disabled;
 	ss->define_sid = true;
 	ZVAL_UNDEF(&ss->http_vars);
 	ZVAL_UNDEF(&ss->sym);   /* a new request has no $_SESSION until session_start() */
-	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
-		zend_string *v = scope_sess_ini[i] ? scope_ini_initial(scope_sess_ini[i]) : NULL;
-		ss->ini[i] = v ? zend_string_copy(v) : NULL;
-	}
 	return ss;
 }
 
@@ -557,16 +539,12 @@ static void scope_sess_free(scope_sess *ss)
 	for (size_t i = 0; i < sizeof(ss->user_names) / sizeof(zval); i++) {
 		zval_ptr_dtor(&names[i]);
 	}
-	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
-		if (ss->ini[i]) zend_string_release(ss->ini[i]);
-	}
 	memset(ss, 0, sizeof(*ss));
 }
 
 /* Move the live session state into from and to's into the live globals (to is left empty). */
 static void scope_sess_swap(scope_sess *from, scope_sess *to)
 {
-	php_session_status status;
 	zval *sym, in = to->sym;
 	bool indirect;
 
@@ -574,32 +552,6 @@ static void scope_sess_swap(scope_sess *from, scope_sess *to)
 	SCOPE_SESS_FIELDS(SCOPE_SESS_MOVE)
 #undef SCOPE_SESS_MOVE
 
-	/* The ini entries. The handlers refuse changes while a session is active, so the status
-	 * is "none" while they run; the stage skips their headers-sent check. */
-	status = scope_ps->session_status;
-	scope_ps->session_status = php_session_none;
-	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
-		zend_ini_entry *e = scope_sess_ini[i];
-		zend_string *live, *want = to->ini[i];
-
-		if (e == NULL) {
-			from->ini[i] = NULL;
-			continue;
-		}
-		live = e->value;
-		if (want == NULL) {
-			from->ini[i] = live ? zend_string_copy(live) : NULL;
-		} else if (live && (want == live || zend_string_equals(want, live))) {
-			from->ini[i] = want;   /* same value: the globals keep pointing at the live one */
-		} else {
-			if (e->on_modify) {
-				e->on_modify(e, want, e->mh_arg1, e->mh_arg2, e->mh_arg3, ZEND_INI_STAGE_DEACTIVATE);
-			}
-			e->value = want;
-			from->ini[i] = live;
-		}
-	}
-	scope_ps->session_status = status;
 	memset(to, 0, sizeof(*to));
 	ZVAL_UNDEF(&to->http_vars);
 
@@ -1822,10 +1774,6 @@ static PHP_MINIT_FUNCTION(scope)
 		zend_module_entry *session = zend_hash_str_find_ptr(&module_registry, ZEND_STRL("session"));
 		if (session && session->globals_size == sizeof(php_ps_globals)) {
 			scope_ps = session->globals_ptr;
-			for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
-				scope_sess_ini[i] = zend_hash_str_find_ptr(EG(ini_directives),
-					scope_sess_ini_names[i], strlen(scope_sess_ini_names[i]));
-			}
 		}
 	}
 #endif
