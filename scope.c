@@ -41,7 +41,7 @@
 #include "ext/session/php_session.h"
 #include "scope_arginfo.h"
 
-#define PHP_SCOPE_VERSION "0.4.1"
+#define PHP_SCOPE_VERSION "0.4.2"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -192,6 +192,8 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	HashTable ctx_resumer;  /* (uintptr_t)zend_fiber_context => its resumer while it is not running */
 	zend_object *gen_last;  /* the generator that switched in last, and its array (a lookup cache) */
 	zend_array *gen_last_a;
+	Bucket *sym_cache[7];   /* symbol-table buckets of the six superglobals and $_SESSION (see scope_symbol()) */
+	zend_string *sym_cache_key[7];   /* the key each of those buckets had when found */
 ZEND_END_MODULE_GLOBALS(scope)
 
 ZEND_DECLARE_MODULE_GLOBALS(scope)
@@ -309,15 +311,44 @@ static zend_object *scope_generator_create(zend_class_entry *ce)
 static const char *const scope_sg_names[SCOPE_SG_N] = { "_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST", "_SERVER" };
 static const int scope_sg_track[SCOPE_SG_N] = { TRACK_VARS_GET, TRACK_VARS_POST, TRACK_VARS_COOKIE, TRACK_VARS_FILES, -1, TRACK_VARS_SERVER };
 
+/* The six superglobals' names and $_SESSION's, interned at MINIT so a lookup needs no hashing. */
+#define SCOPE_SYM_SESSION SCOPE_SG_N
+static zend_string *scope_sym_key[SCOPE_SG_N + 1];
+
+/* A variable's entry in the global symbol table. The bucket found last time is reused while
+ * it still holds that variable (inside the table, same key, not deleted); a resize
+ * or compaction that moved it falls back to a lookup with the precomputed hash. NULL: absent. */
+static zend_always_inline zval *scope_symbol(int i)
+{
+	HashTable *ht = &EG(symbol_table);
+	Bucket *b = SCOPE_G(sym_cache)[i];
+	zval *z;
+
+	/* The bucket's key is compared with the key it had when found: by pointer, because the
+	 * table's key may be another string than ours (opcache moves interned strings to shared
+	 * memory after MINIT, and ext/session adds _SESSION under a key of its own), and by hash,
+	 * because a key of its own may be freed and its memory reused for another name. */
+	if (b && b >= ht->arData && b < ht->arData + ht->nNumUsed && b->key == SCOPE_G(sym_cache_key)[i]
+		&& b->h == ZSTR_H(scope_sym_key[i]) && Z_TYPE(b->val) != IS_UNDEF) {
+		z = &b->val;
+	} else {
+		z = zend_hash_find_known_hash(ht, scope_sym_key[i]);
+		b = (Bucket *) z;   /* a bucket starts with its zval */
+		SCOPE_G(sym_cache)[i] = b;
+		SCOPE_G(sym_cache_key)[i] = b ? b->key : NULL;
+	}
+	return z;
+}
+
 /* The live entry of a superglobal. The auto-globals are created lazily (auto_globals_jit),
  * so the first time we need one, ask the engine to create it. */
-static zval *scope_sg_live(int i)
+static zend_always_inline zval *scope_sg_live(int i)
 {
-	zval *z = zend_hash_str_find(&EG(symbol_table), scope_sg_names[i], strlen(scope_sg_names[i]));
+	zval *z = scope_symbol(i);
 
-	if (z == NULL) {
-		zend_is_auto_global_str(scope_sg_names[i], strlen(scope_sg_names[i]));
-		z = zend_hash_str_find(&EG(symbol_table), scope_sg_names[i], strlen(scope_sg_names[i]));
+	if (UNEXPECTED(z == NULL)) {
+		zend_is_auto_global(scope_sym_key[i]);
+		z = scope_symbol(i);
 	}
 	if (z != NULL && Z_TYPE_P(z) == IS_INDIRECT) {
 		z = Z_INDIRECT_P(z);
@@ -353,7 +384,7 @@ static void scope_sg_free(zval *sg)
 static void scope_sg_swap(zval *from, zval *to)
 {
 	for (int i = 0; i < SCOPE_SG_N; i++) {
-		zval *live = scope_sg_live(i);
+		zval *live = scope_sg_live(i);   /* a cached bucket, checked by its key: a few compares */
 
 		if (live == NULL || Z_TYPE(to[i]) == IS_UNDEF) {
 			continue;
@@ -362,8 +393,12 @@ static void scope_sg_swap(zval *from, zval *to)
 		ZVAL_COPY_VALUE(live, &to[i]);
 		ZVAL_UNDEF(&to[i]);
 		if (scope_sg_track[i] >= 0) {
-			zval_ptr_dtor(&PG(http_globals)[scope_sg_track[i]]);
-			ZVAL_COPY(&PG(http_globals)[scope_sg_track[i]], live);
+			/* C code (ext/session's cookie lookup, browscap, zlib, ...) reads PG(http_globals) */
+			zval *pg = &PG(http_globals)[scope_sg_track[i]];
+			zval old = *pg;
+
+			ZVAL_COPY(pg, live);
+			i_zval_ptr_dtor(&old);
 		}
 	}
 }
@@ -468,9 +503,15 @@ static void scope_tl_swap(scope_tl *from, scope_tl *to)
 			}
 			from->loc = live ? zend_string_copy(live) : NULL;
 		}
-		if (want && (live == NULL || !zend_string_equals(want, live))) {
+		/* Compared by effective locale: an unset ini means ICU's default, which is what a new
+		 * scope starts with (SCOPE_G(loc_initial)), so the two need no ini change between them. */
+		zend_string *want_eff = want ? want : SCOPE_G(loc_initial);
+		zend_string *live_eff = live ? live : SCOPE_G(loc_initial);
+		if (want_eff == live_eff || (want_eff && live_eff && zend_string_equals(want_eff, live_eff))) {
+			/* the same locale: nothing to apply */
+		} else if (want) {
 			zend_alter_ini_entry(SCOPE_G(loc_ini)->name, want, PHP_INI_USER, PHP_INI_STAGE_RUNTIME);
-		} else if (want == NULL && live != NULL) {
+		} else {
 			zend_restore_ini_entry(SCOPE_G(loc_ini)->name, PHP_INI_STAGE_RUNTIME);   /* back to the ini value (unset) */
 		}
 	}
@@ -507,7 +548,6 @@ static php_ps_globals *scope_ps;
 	X(define_sid, define_sid) X(in_save_handler, in_save_handler) X(set_handler, set_handler) \
 	SCOPE_SESS_STARTED(X)
 
-/* The ini value a new request starts with. */
 /* A new scope's session state: none started, the save handler of the session.save_handler ini. */
 static scope_sess *scope_sess_new(void)
 {
@@ -559,7 +599,7 @@ static void scope_sess_swap(scope_sess *from, scope_sess *to)
 	 * (session_start() makes it a reference to http_session_vars, and it keeps its array after
 	 * session_write_close(), session_abort() or session_destroy(), as in a request) is moved
 	 * out, and the incoming scope's put in, or removed if it has none. */
-	sym = zend_hash_str_find(&EG(symbol_table), ZEND_STRL("_SESSION"));
+	sym = scope_symbol(SCOPE_SYM_SESSION);
 	indirect = sym && Z_TYPE_P(sym) == IS_INDIRECT;   /* a CV slot of {main}: emptied, never removed */
 	if (indirect) {
 		sym = Z_INDIRECT_P(sym);
@@ -574,10 +614,10 @@ static void scope_sess_swap(scope_sess *from, scope_sess *to)
 		if (sym) {
 			ZVAL_COPY_VALUE(sym, &in);
 		} else {
-			zend_hash_str_add_new(&EG(symbol_table), ZEND_STRL("_SESSION"), &in);
+			zend_hash_add_new(&EG(symbol_table), scope_sym_key[SCOPE_SYM_SESSION], &in);
 		}
 	} else if (sym && !indirect) {
-		zend_hash_str_del(&EG(symbol_table), ZEND_STRL("_SESSION"));   /* its value is UNDEF: nothing freed */
+		zend_hash_del(&EG(symbol_table), scope_sym_key[SCOPE_SYM_SESSION]);   /* its value is UNDEF: nothing freed */
 	}
 }
 
@@ -1777,6 +1817,10 @@ static PHP_MINIT_FUNCTION(scope)
 		}
 	}
 #endif
+	for (int i = 0; i < SCOPE_SG_N; i++) {
+		scope_sym_key[i] = zend_string_init_interned(scope_sg_names[i], strlen(scope_sg_names[i]), 1);
+	}
+	scope_sym_key[SCOPE_SYM_SESSION] = zend_string_init_interned("_SESSION", sizeof("_SESSION") - 1, 1);
 	scope_ce = register_class_Scope();
 	memcpy(&scope_handlers, &std_object_handlers, sizeof(zend_object_handlers));
 	scope_handlers.offset = XtOffsetOf(scope_object, std);
@@ -1837,6 +1881,8 @@ static PHP_RINIT_FUNCTION(scope)
 	ZVAL_ARR(&SCOPE_G(main), scope_array_new(&null));
 	SCOPE_G(cur) = Z_ARR(SCOPE_G(main));
 	ZVAL_UNDEF(&SCOPE_G(members));   /* created with the first Scope */
+	memset(SCOPE_G(sym_cache), 0, sizeof(SCOPE_G(sym_cache)));
+	memset(SCOPE_G(sym_cache_key), 0, sizeof(SCOPE_G(sym_cache_key)));
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(ctx_resumer), 8, NULL, NULL, 0);

@@ -40,6 +40,14 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Release 0.4.2
+
+0.4.2 makes the session settings request-wide, as the RFC specifies: `session_name()`, `session_set_cookie_params()`,
+`session_cache_limiter()` and `ini_set()` of `session.*` change them for every scope, and a new scope's save handler is
+the current `session.save_handler`. Only the session itself (its id, status, save handler state and `$_SESSION`) is per
+scope. Switching scopes is also faster: a generator step that crosses scopes went from about 530 ns to about 230 ns
+(PHP 8.5, opcache on, JIT off), and steps within one scope cost what they did.
+
 ## Release 0.4.1
 
 0.4.1 fixes a crash in generators whose `finally` block ends with a `yield`, when an exception or a `return`

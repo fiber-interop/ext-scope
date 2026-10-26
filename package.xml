@@ -12,7 +12,7 @@
  </lead>
  <date>2026-10-26</date>
  <version>
-  <release>0.4.1</release>
+  <release>0.4.2</release>
   <api>0.4.0</api>
  </version>
  <stability>
@@ -20,7 +20,7 @@
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.4.1: a generator whose finally block ends with a yield no longer crashes when an exception or a return enters the block (finally_end was moved onto an inserted scope switch; found with php-src's test suite); the extension allocates no object until the first Scope, so object ids are as without it; a scope destroyed with its session active writes and closes it in the destructor phase, so user save handlers (session_set_save_handler()) run safely, also when the scope is collected as a cycle or is alive at request shutdown (fixes a use-after-free when ending the session released the scope); Scope reports its superglobals and session to the cycle collector; $_SESSION is per scope like the other superglobals (a new scope has none, and it keeps its array after session_write_close(), session_abort() and session_destroy(), as in a request).</notes>
+ <notes>0.4.2: session settings are request-wide, as the RFC specifies: session_name(), session_set_cookie_params(), session_cache_limiter() and ini_set() of session.* change them for every scope, and a new scope's save handler is the current session.save_handler; only the session itself (id, status, save handler state, $_SESSION) is per scope. Switching scopes is faster: a generator step that crosses scopes went from about 530 ns to about 230 ns (the locale is written only when it differs, and the superglobal entries are found through a cached bucket). The README notes that two scopes opening the same session id with a locking save handler (files, memcached, redis) deadlock the process.</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
