@@ -32,6 +32,9 @@
    <file name="README.md" role="doc"/>
    <dir name="tests">
     <file name="names.inc" role="test"/>
+    <file name="auto_globals_jit.inc" role="test"/>
+    <file name="auto_globals_jit_0.phpt" role="test"/>
+    <file name="auto_globals_jit_1.phpt" role="test"/>
     <file name="bailout.phpt" role="test"/>
     <file name="bind.phpt" role="test"/>
     <file name="bind_rebind.phpt" role="test"/>

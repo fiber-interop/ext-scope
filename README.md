@@ -112,7 +112,9 @@ When the current scope changes (`run()` entering or leaving, a fiber switch, a g
 six arrays are moved between the scope's storage and the live `EG(symbol_table)` entries, which is where compiled
 `$_GET` accesses read and write, and `PG(http_globals)[TRACK_VARS_*]` is re-pointed at the same array for C code
 such as `filter_input()`. The cost of a switch is six symbol-table lookups and pointer moves; no array is copied.
-The first scope creation makes the engine create the six lazily-created auto-globals (`auto_globals_jit`).
+With `auto_globals_jit` (the default), `$_SERVER` and `$_REQUEST` are built only when a compiled file first uses
+them. The first scope creation, and every switch, makes the engine build them first, so a file compiled later inside
+a scope can't have its build overwrite the scope's array. Before the first `Scope`, the lazy build is unchanged.
 
 `scope.superglobals` (default `1`, `PHP_INI_SYSTEM`) turns this off, so the vote can be shown independently
 of the base proposal: with `0`, all scopes share the SAPI's arrays (and the session, see below).
