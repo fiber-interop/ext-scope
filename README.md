@@ -40,6 +40,17 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Release 0.4.1
+
+0.4.1 fixes a crash in generators whose `finally` block ends with a `yield`, when an exception or a `return`
+enters the block (found by running php-src's tests with the extension loaded: Zend, standard, session, date, intl,
+reflection and SPL now fail the same tests with and without it). The extension also allocates no object until the
+first `Scope` is created, so object ids (`#1`, `spl_object_id()`) are the same as without it in code that never uses
+one. And it fixes the session's end when a scope is destroyed: it now runs in the destructor phase, so user save handlers
+run safely, also when the scope is collected as a cycle or is still alive at request shutdown (this fixes a
+use-after-free when ending the session released the last reference to the scope). `Scope` reports its state to the
+cycle collector, and `$_SESSION` is per scope like the other superglobals.
+
 ## Release 0.4.0
 
 0.4.0 implements the Scope RFC 0.9:
@@ -110,7 +121,8 @@ of the base proposal: with `0`, all scopes share the SAPI's arrays (and the sess
 
 When ext/session is loaded (it is an optional dependency), its request state follows the scope too:
 
-- Swapped at each scope change: `$_SESSION` (kept in step with ext/session's `http_session_vars`), the session id,
+- Swapped at each scope change: `$_SESSION`, the scope's own like the other superglobals (a new scope has none, and
+  it keeps its array after `session_write_close()`, `session_abort()` or `session_destroy()`, as in a request), the session id,
   status, the save handler module and its data (`mod`, `mod_data`), user save handlers
   (`session_set_save_handler()`: the handler callables, class name, open/implemented flags), the serialized original
   data (`session_vars`), `send_cookie`, `define_sid`, `in_save_handler`, `set_handler` and the "started at" file and
@@ -122,10 +134,13 @@ When ext/session is loaded (it is an optional dependency), its request state fol
 - A new scope has no session (`PHP_SESSION_NONE`), the ini values of those entries, and the save handler of the
   `session.save_handler` ini (not a handler the creator set with `session_set_save_handler()`).
 - `session_start()` inside a scope starts that scope's session; all its fibers and generators share it.
-- A scope destroyed with its session active writes and closes it, as request end does; scopes still alive at
-  request end are written and closed before ext/session's own shutdown handles the root's.
+- A scope destroyed with its session active writes and closes it, as request end does. This happens in the
+  destructor phase, so a user save handler's `write()` and `close()` run as a destructor would: when the last
+  reference goes, before `gc_collect_cycles()` frees a cycle the scope is in, or at request shutdown for scopes
+  still alive, before ext/session's own shutdown handles the root's. An exception from the handler propagates as one
+  from a destructor. `Scope` reports its superglobals, `$_SESSION` and save handler to the cycle collector.
 - Not swapped: other session ini entries (`session.save_handler`, `session.serialize_handler`, `use_*`, gc settings)
-  stay request-wide. While no scope has session data, `$_SESSION` is an ordinary global.
+  stay request-wide.
 
 `scope.session` (default `1`, `PHP_INI_SYSTEM`) turns only this off; it is also off when `scope.superglobals=0`.
 The session is not swapped on ZTS builds.

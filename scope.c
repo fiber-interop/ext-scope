@@ -41,7 +41,7 @@
 #include "ext/session/php_session.h"
 #include "scope_arginfo.h"
 
-#define PHP_SCOPE_VERSION "0.4.0"
+#define PHP_SCOPE_VERSION "0.4.1"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -144,6 +144,7 @@ typedef struct {
 #endif
 	zend_string *vars;
 	zval http_vars;
+	zval sym;   /* its $_SESSION, as the symbol table held it; UNDEF: no $_SESSION */
 	bool send_cookie;
 	bool define_sid;
 	bool in_save_handler;
@@ -235,17 +236,28 @@ static zend_always_inline zval *scope_current(zend_array *a)
 	return zend_hash_index_find(a, SCOPE_CURRENT);
 }
 
-/* The array of a Fiber or Generator object, or NULL. */
+/* The array of a Fiber or Generator object, or NULL while no Scope exists (all of them
+ * are the root's then). The WeakMap is created with the first Scope, so a request that
+ * never uses one allocates no object of the extension's and sees the same object ids as
+ * without it. A fiber or generator without an entry was created before that: it is the
+ * root's, and gets its array now. */
 static zend_array *scope_member_array(zend_object *obj)
 {
-	zval key, rv, *v;
+	zval key, rv, *v, null, arr;
 
-	if (!SCOPE_G(active)) {
+	if (!SCOPE_G(active) || Z_ISUNDEF(SCOPE_G(members))) {
 		return NULL;
 	}
 	ZVAL_OBJ(&key, obj);
 	v = Z_OBJ_HT(SCOPE_G(members))->read_dimension(Z_OBJ(SCOPE_G(members)), &key, BP_VAR_IS, &rv);
-	return v && Z_TYPE_P(v) == IS_ARRAY ? Z_ARR_P(v) : NULL;
+	if (v && Z_TYPE_P(v) == IS_ARRAY) {
+		return Z_ARR_P(v);
+	}
+	ZVAL_NULL(&null);
+	ZVAL_ARR(&arr, scope_array_new(&null));
+	Z_OBJ_HT(SCOPE_G(members))->write_dimension(Z_OBJ(SCOPE_G(members)), &key, &arr);
+	zval_ptr_dtor(&arr);   /* the WeakMap holds it now */
+	return Z_ARR(arr);
 }
 
 /* A Fiber or Generator belongs to the scope that is current when it is created. */
@@ -253,8 +265,8 @@ static void scope_register_member(zend_object *obj)
 {
 	zval key, arr;
 
-	if (!SCOPE_G(active) || SCOPE_G(cur) == NULL) {
-		return;
+	if (!SCOPE_G(active) || SCOPE_G(cur) == NULL || Z_ISUNDEF(SCOPE_G(members))) {
+		return;   /* no Scope yet: a member of the root, recorded when first looked up */
 	}
 	ZVAL_ARR(&arr, scope_array_new(scope_current(SCOPE_G(cur))));
 	ZVAL_OBJ(&key, obj);
@@ -521,6 +533,7 @@ static scope_sess *scope_sess_new(void)
 	ss->status = ss->mod ? php_session_none : php_session_disabled;
 	ss->define_sid = true;
 	ZVAL_UNDEF(&ss->http_vars);
+	ZVAL_UNDEF(&ss->sym);   /* a new request has no $_SESSION until session_start() */
 	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
 		zend_string *v = scope_sess_ini[i] ? scope_ini_initial(scope_sess_ini[i]) : NULL;
 		ss->ini[i] = v ? zend_string_copy(v) : NULL;
@@ -540,6 +553,7 @@ static void scope_sess_free(scope_sess *ss)
 	if (ss->started_file) zend_string_release(ss->started_file);
 #endif
 	zval_ptr_dtor(&ss->http_vars);
+	zval_ptr_dtor(&ss->sym);
 	for (size_t i = 0; i < sizeof(ss->user_names) / sizeof(zval); i++) {
 		zval_ptr_dtor(&names[i]);
 	}
@@ -553,7 +567,8 @@ static void scope_sess_free(scope_sess *ss)
 static void scope_sess_swap(scope_sess *from, scope_sess *to)
 {
 	php_session_status status;
-	zval *sym;
+	zval *sym, in = to->sym;
+	bool indirect;
 
 #define SCOPE_SESS_MOVE(f, g) from->f = scope_ps->g; scope_ps->g = to->f;
 	SCOPE_SESS_FIELDS(SCOPE_SESS_MOVE)
@@ -588,24 +603,29 @@ static void scope_sess_swap(scope_sess *from, scope_sess *to)
 	memset(to, 0, sizeof(*to));
 	ZVAL_UNDEF(&to->http_vars);
 
-	/* $_SESSION is ext/session's own symbol-table zval sharing http_session_vars' reference;
-	 * keep the two together, as session_start() does. Without a "_SESSION" entry, the next
-	 * session_start() creates it. While neither scope has session data, $_SESSION is an
-	 * ordinary global and is left alone. */
+	/* $_SESSION is the scope's own, as the other superglobals are: what the symbol table holds
+	 * (session_start() makes it a reference to http_session_vars, and it keeps its array after
+	 * session_write_close(), session_abort() or session_destroy(), as in a request) is moved
+	 * out, and the incoming scope's put in, or removed if it has none. */
 	sym = zend_hash_str_find(&EG(symbol_table), ZEND_STRL("_SESSION"));
-	if (sym && (!Z_ISUNDEF(from->http_vars) || !Z_ISUNDEF(scope_ps->http_session_vars))) {
-		zval old;
-
-		if (Z_TYPE_P(sym) == IS_INDIRECT) {
-			sym = Z_INDIRECT_P(sym);
-		}
-		old = *sym;
-		if (Z_ISUNDEF(scope_ps->http_session_vars)) {
-			ZVAL_NULL(sym);
+	indirect = sym && Z_TYPE_P(sym) == IS_INDIRECT;   /* a CV slot of {main}: emptied, never removed */
+	if (indirect) {
+		sym = Z_INDIRECT_P(sym);
+	}
+	if (sym && !Z_ISUNDEF_P(sym)) {
+		ZVAL_COPY_VALUE(&from->sym, sym);
+		ZVAL_UNDEF(sym);
+	} else {
+		ZVAL_UNDEF(&from->sym);
+	}
+	if (!Z_ISUNDEF(in)) {
+		if (sym) {
+			ZVAL_COPY_VALUE(sym, &in);
 		} else {
-			ZVAL_COPY(sym, &scope_ps->http_session_vars);
+			zend_hash_str_add_new(&EG(symbol_table), ZEND_STRL("_SESSION"), &in);
 		}
-		zval_ptr_dtor(&old);
+	} else if (sym && !indirect) {
+		zend_hash_str_del(&EG(symbol_table), ZEND_STRL("_SESSION"));   /* its value is UNDEF: nothing freed */
 	}
 }
 
@@ -896,7 +916,8 @@ static zend_function *scope_switch_func[2];
  * targets become offsets (and before RETURN becomes GENERATOR_RETURN), like
  * ext-phasync's checkpoint injection: every opline number the op_array and the
  * compiler context refer to is moved past the calls inserted before it. */
-static void scope_raw_map_targets(zend_op_array *op_array, uint32_t (*map)(uint32_t, void *), void *arg)
+static void scope_raw_map_targets(zend_op_array *op_array, uint32_t (*map)(uint32_t, void *),
+	uint32_t (*map_finally_end)(uint32_t, void *), void *arg)
 {
 	for (uint32_t i = 0; i < op_array->last; i++) {
 		zend_op *op = &op_array->opcodes[i];
@@ -951,7 +972,7 @@ static void scope_raw_map_targets(zend_op_array *op_array, uint32_t (*map)(uint3
 		tc->try_op = map(tc->try_op, arg);
 		tc->catch_op = map(tc->catch_op, arg);
 		tc->finally_op = map(tc->finally_op, arg);
-		tc->finally_end = map(tc->finally_end, arg);
+		tc->finally_end = map_finally_end(tc->finally_end, arg);
 	}
 	for (int i = 0; i < CG(context).last_brk_cont; i++) {
 		zend_brk_cont_element *bc = &CG(context).brk_cont_array[i];
@@ -994,6 +1015,27 @@ static uint32_t scope_shift_target(uint32_t t, void *arg)
 		uint32_t mid = (lo + hi) / 2;
 
 		if ((s->at[mid] >> 1) < t) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return t + lo * SCOPE_SWITCH_OPS;
+}
+
+/* finally_end names the block's FAST_RET itself: the engine reads the finally's fast_call
+ * variable from opcodes[finally_end].op1 when an exception or return enters the block. It
+ * moves past the switches inserted at it (one is, after a yield that ends the block), not
+ * onto them. */
+static uint32_t scope_shift_past(uint32_t t, void *arg)
+{
+	const scope_shift *s = arg;
+	uint32_t lo = 0, hi = s->n;
+
+	while (lo < hi) {   /* how many insertion points are <= t */
+		uint32_t mid = (lo + hi) / 2;
+
+		if ((s->at[mid] >> 1) <= t) {
 			lo = mid + 1;
 		} else {
 			hi = mid;
@@ -1062,7 +1104,7 @@ static void scope_op_array_handler(zend_op_array *op_array)
 	qsort(at, n, sizeof(uint32_t), scope_cmp_u32);
 
 	shift = (scope_shift) { at, n };
-	scope_raw_map_targets(op_array, scope_shift_target, &shift);
+	scope_raw_map_targets(op_array, scope_shift_target, scope_shift_past, &shift);
 
 	opcodes = emalloc(sizeof(zend_op) * (last + n * SCOPE_SWITCH_OPS));
 	for (uint32_t i = 0, j = 0, o = 0; i <= last; i++) {
@@ -1311,6 +1353,9 @@ static zend_object *scope_create(zend_class_entry *ce)
 	zend_object_std_init(&so->std, ce);
 	object_properties_init(&so->std, ce);
 	so->std.handlers = &scope_handlers;
+	if (SCOPE_G(active) && Z_ISUNDEF(SCOPE_G(members))) {
+		object_init_ex(&SCOPE_G(members), scope_weakmap_ce);   /* the first Scope of the request */
+	}
 	if (SCOPE_G(superglobals) && SCOPE_G(active)) {
 		so->sg = scope_sg_new();
 	}
@@ -1323,6 +1368,49 @@ static zend_object *scope_create(zend_class_entry *ce)
 	return &so->std;
 }
 
+/* A scope destroyed with its session still active writes and closes it here, in the destructor
+ * phase, because a save handler may be user code (session_set_save_handler()); free_obj is too
+ * late for that, e.g. inside gc_collect_cycles(). The engine calls this when the last reference
+ * goes, from the GC before it frees a cycle, and for every live object at request shutdown
+ * before RSHUTDOWN. An exception from the handler propagates as one from a destructor would. */
+static void scope_dtor(zend_object *obj)
+{
+	scope_object *so = SCOPE_OBJECT(obj);
+	if (so->sess && SCOPE_G(active) && SCOPE_G(applied) != obj) {
+		scope_sess *ss = so->sess;
+		so->sess = NULL;
+		scope_sess_end(ss);
+		efree(ss);
+	}
+	zend_objects_destroy_object(obj);
+}
+
+/* What a scope holds while it is not the applied one (the applied scope's values are in the
+ * live globals, and its stored ones are UNDEF): its superglobals, its $_SESSION and its user
+ * save handler. Reporting them lets the cycle collector free a cycle through them, such as a
+ * save handler that refers back to an object holding the scope. */
+static HashTable *scope_get_gc(zend_object *obj, zval **table, int *n)
+{
+	scope_object *so = SCOPE_OBJECT(obj);
+	zend_get_gc_buffer *buf = zend_get_gc_buffer_create();
+
+	if (so->sg) {
+		for (int i = 0; i < SCOPE_SG_N; i++) {
+			zend_get_gc_buffer_add_zval(buf, &so->sg[i]);
+		}
+	}
+	if (so->sess) {
+		zval *names = (zval *) &so->sess->user_names;
+		for (size_t i = 0; i < sizeof(so->sess->user_names) / sizeof(zval); i++) {
+			zend_get_gc_buffer_add_zval(buf, &names[i]);
+		}
+		zend_get_gc_buffer_add_zval(buf, &so->sess->http_vars);
+		zend_get_gc_buffer_add_zval(buf, &so->sess->sym);
+	}
+	zend_get_gc_buffer_use(buf, table, n);
+	return zend_std_get_properties(obj);
+}
+
 static void scope_free(zend_object *obj)
 {
 	scope_object *so = SCOPE_OBJECT(obj);
@@ -1333,11 +1421,7 @@ static void scope_free(zend_object *obj)
 	scope_sg_free(so->sg);
 	scope_tl_free(&so->tl);
 	if (so->sess) {
-		if (SCOPE_G(active) && SCOPE_G(applied) != obj) {
-			scope_sess_end(so->sess);   /* destroyed with its session still active: write and close it */
-		} else {
-			scope_sess_free(so->sess);
-		}
+		scope_sess_free(so->sess);   /* not ended by scope_dtor(): no user code runs here */
 		efree(so->sess);
 	}
 	if (so->state) {
@@ -1748,6 +1832,8 @@ static PHP_MINIT_FUNCTION(scope)
 	scope_ce = register_class_Scope();
 	memcpy(&scope_handlers, &std_object_handlers, sizeof(zend_object_handlers));
 	scope_handlers.offset = XtOffsetOf(scope_object, std);
+	scope_handlers.dtor_obj = scope_dtor;
+	scope_handlers.get_gc = scope_get_gc;
 	scope_handlers.free_obj = scope_free;
 	scope_handlers.clone_obj = NULL;   /* a scope is an identity: a copy would be another scope */
 	scope_ce->create_object = scope_create;
@@ -1802,7 +1888,7 @@ static PHP_RINIT_FUNCTION(scope)
 	ZVAL_NULL(&null);
 	ZVAL_ARR(&SCOPE_G(main), scope_array_new(&null));
 	SCOPE_G(cur) = Z_ARR(SCOPE_G(main));
-	object_init_ex(&SCOPE_G(members), scope_weakmap_ce);
+	ZVAL_UNDEF(&SCOPE_G(members));   /* created with the first Scope */
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(ctx_resumer), 8, NULL, NULL, 0);
@@ -1838,9 +1924,12 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 		for (uint32_t i = 1; i < EG(objects_store).top; i++) {
 			zend_object *obj = EG(objects_store).object_buckets[i];
 			if (IS_OBJ_VALID(obj) && obj->ce == scope_ce && SCOPE_OBJECT(obj)->sess) {
-				scope_sess_end(SCOPE_OBJECT(obj)->sess);
-				efree(SCOPE_OBJECT(obj)->sess);
+				/* Detached first: ending it may release the last reference to this scope
+				 * (through the save handler or $_SESSION), and scope_free() must not see it. */
+				scope_sess *ss = SCOPE_OBJECT(obj)->sess;
 				SCOPE_OBJECT(obj)->sess = NULL;
+				scope_sess_end(ss);
+				efree(ss);
 			}
 		}
 	}
@@ -1864,6 +1953,7 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 	SCOPE_G(resumer) = NULL;
 	SCOPE_G(gen_last) = NULL;
 	zval_ptr_dtor(&SCOPE_G(members));
+	ZVAL_UNDEF(&SCOPE_G(members));
 	zval_ptr_dtor(&SCOPE_G(main));
 	if (SCOPE_G(root)) {
 		OBJ_RELEASE(SCOPE_G(root));   /* scope_free() clears SCOPE_G(root) if this was the last reference */
