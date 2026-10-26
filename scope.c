@@ -236,17 +236,28 @@ static zend_always_inline zval *scope_current(zend_array *a)
 	return zend_hash_index_find(a, SCOPE_CURRENT);
 }
 
-/* The array of a Fiber or Generator object, or NULL. */
+/* The array of a Fiber or Generator object, or NULL while no Scope exists (all of them
+ * are the root's then). The WeakMap is created with the first Scope, so a request that
+ * never uses one allocates no object of the extension's and sees the same object ids as
+ * without it. A fiber or generator without an entry was created before that: it is the
+ * root's, and gets its array now. */
 static zend_array *scope_member_array(zend_object *obj)
 {
-	zval key, rv, *v;
+	zval key, rv, *v, null, arr;
 
-	if (!SCOPE_G(active)) {
+	if (!SCOPE_G(active) || Z_ISUNDEF(SCOPE_G(members))) {
 		return NULL;
 	}
 	ZVAL_OBJ(&key, obj);
 	v = Z_OBJ_HT(SCOPE_G(members))->read_dimension(Z_OBJ(SCOPE_G(members)), &key, BP_VAR_IS, &rv);
-	return v && Z_TYPE_P(v) == IS_ARRAY ? Z_ARR_P(v) : NULL;
+	if (v && Z_TYPE_P(v) == IS_ARRAY) {
+		return Z_ARR_P(v);
+	}
+	ZVAL_NULL(&null);
+	ZVAL_ARR(&arr, scope_array_new(&null));
+	Z_OBJ_HT(SCOPE_G(members))->write_dimension(Z_OBJ(SCOPE_G(members)), &key, &arr);
+	zval_ptr_dtor(&arr);   /* the WeakMap holds it now */
+	return Z_ARR(arr);
 }
 
 /* A Fiber or Generator belongs to the scope that is current when it is created. */
@@ -254,8 +265,8 @@ static void scope_register_member(zend_object *obj)
 {
 	zval key, arr;
 
-	if (!SCOPE_G(active) || SCOPE_G(cur) == NULL) {
-		return;
+	if (!SCOPE_G(active) || SCOPE_G(cur) == NULL || Z_ISUNDEF(SCOPE_G(members))) {
+		return;   /* no Scope yet: a member of the root, recorded when first looked up */
 	}
 	ZVAL_ARR(&arr, scope_array_new(scope_current(SCOPE_G(cur))));
 	ZVAL_OBJ(&key, obj);
@@ -905,7 +916,8 @@ static zend_function *scope_switch_func[2];
  * targets become offsets (and before RETURN becomes GENERATOR_RETURN), like
  * ext-phasync's checkpoint injection: every opline number the op_array and the
  * compiler context refer to is moved past the calls inserted before it. */
-static void scope_raw_map_targets(zend_op_array *op_array, uint32_t (*map)(uint32_t, void *), void *arg)
+static void scope_raw_map_targets(zend_op_array *op_array, uint32_t (*map)(uint32_t, void *),
+	uint32_t (*map_finally_end)(uint32_t, void *), void *arg)
 {
 	for (uint32_t i = 0; i < op_array->last; i++) {
 		zend_op *op = &op_array->opcodes[i];
@@ -960,7 +972,7 @@ static void scope_raw_map_targets(zend_op_array *op_array, uint32_t (*map)(uint3
 		tc->try_op = map(tc->try_op, arg);
 		tc->catch_op = map(tc->catch_op, arg);
 		tc->finally_op = map(tc->finally_op, arg);
-		tc->finally_end = map(tc->finally_end, arg);
+		tc->finally_end = map_finally_end(tc->finally_end, arg);
 	}
 	for (int i = 0; i < CG(context).last_brk_cont; i++) {
 		zend_brk_cont_element *bc = &CG(context).brk_cont_array[i];
@@ -1003,6 +1015,27 @@ static uint32_t scope_shift_target(uint32_t t, void *arg)
 		uint32_t mid = (lo + hi) / 2;
 
 		if ((s->at[mid] >> 1) < t) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return t + lo * SCOPE_SWITCH_OPS;
+}
+
+/* finally_end names the block's FAST_RET itself: the engine reads the finally's fast_call
+ * variable from opcodes[finally_end].op1 when an exception or return enters the block. It
+ * moves past the switches inserted at it (one is, after a yield that ends the block), not
+ * onto them. */
+static uint32_t scope_shift_past(uint32_t t, void *arg)
+{
+	const scope_shift *s = arg;
+	uint32_t lo = 0, hi = s->n;
+
+	while (lo < hi) {   /* how many insertion points are <= t */
+		uint32_t mid = (lo + hi) / 2;
+
+		if ((s->at[mid] >> 1) <= t) {
 			lo = mid + 1;
 		} else {
 			hi = mid;
@@ -1071,7 +1104,7 @@ static void scope_op_array_handler(zend_op_array *op_array)
 	qsort(at, n, sizeof(uint32_t), scope_cmp_u32);
 
 	shift = (scope_shift) { at, n };
-	scope_raw_map_targets(op_array, scope_shift_target, &shift);
+	scope_raw_map_targets(op_array, scope_shift_target, scope_shift_past, &shift);
 
 	opcodes = emalloc(sizeof(zend_op) * (last + n * SCOPE_SWITCH_OPS));
 	for (uint32_t i = 0, j = 0, o = 0; i <= last; i++) {
@@ -1320,6 +1353,9 @@ static zend_object *scope_create(zend_class_entry *ce)
 	zend_object_std_init(&so->std, ce);
 	object_properties_init(&so->std, ce);
 	so->std.handlers = &scope_handlers;
+	if (SCOPE_G(active) && Z_ISUNDEF(SCOPE_G(members))) {
+		object_init_ex(&SCOPE_G(members), scope_weakmap_ce);   /* the first Scope of the request */
+	}
 	if (SCOPE_G(superglobals) && SCOPE_G(active)) {
 		so->sg = scope_sg_new();
 	}
@@ -1852,7 +1888,7 @@ static PHP_RINIT_FUNCTION(scope)
 	ZVAL_NULL(&null);
 	ZVAL_ARR(&SCOPE_G(main), scope_array_new(&null));
 	SCOPE_G(cur) = Z_ARR(SCOPE_G(main));
-	object_init_ex(&SCOPE_G(members), scope_weakmap_ce);
+	ZVAL_UNDEF(&SCOPE_G(members));   /* created with the first Scope */
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(ctx_resumer), 8, NULL, NULL, 0);
@@ -1917,6 +1953,7 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 	SCOPE_G(resumer) = NULL;
 	SCOPE_G(gen_last) = NULL;
 	zval_ptr_dtor(&SCOPE_G(members));
+	ZVAL_UNDEF(&SCOPE_G(members));
 	zval_ptr_dtor(&SCOPE_G(main));
 	if (SCOPE_G(root)) {
 		OBJ_RELEASE(SCOPE_G(root));   /* scope_free() clears SCOPE_G(root) if this was the last reference */

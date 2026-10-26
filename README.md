@@ -42,7 +42,11 @@ from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
 ## Release 0.4.1
 
-0.4.1 fixes the session's end when a scope is destroyed: it now runs in the destructor phase, so user save handlers
+0.4.1 fixes a crash in generators whose `finally` block ends with a `yield`, when an exception or a `return`
+enters the block (found by running php-src's tests with the extension loaded: Zend, standard, session, date, intl,
+reflection and SPL now fail the same tests with and without it). The extension also allocates no object until the
+first `Scope` is created, so object ids (`#1`, `spl_object_id()`) are the same as without it in code that never uses
+one. And it fixes the session's end when a scope is destroyed: it now runs in the destructor phase, so user save handlers
 run safely, also when the scope is collected as a cycle or is still alive at request shutdown (this fixes a
 use-after-free when ending the session released the last reference to the scope). `Scope` reports its state to the
 cycle collector, and `$_SESSION` is per scope like the other superglobals.

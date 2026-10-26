@@ -20,7 +20,7 @@
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.4.1: a scope destroyed with its session active writes and closes it in the destructor phase, so user save handlers (session_set_save_handler()) run safely, also when the scope is collected as a cycle or is alive at request shutdown (fixes a use-after-free when ending the session released the scope); Scope reports its superglobals and session to the cycle collector; $_SESSION is per scope like the other superglobals (a new scope has none, and it keeps its array after session_write_close(), session_abort() and session_destroy(), as in a request).</notes>
+ <notes>0.4.1: a generator whose finally block ends with a yield no longer crashes when an exception or a return enters the block (finally_end was moved onto an inserted scope switch; found with php-src's test suite); the extension allocates no object until the first Scope, so object ids are as without it; a scope destroyed with its session active writes and closes it in the destructor phase, so user save handlers (session_set_save_handler()) run safely, also when the scope is collected as a cycle or is alive at request shutdown (fixes a use-after-free when ending the session released the scope); Scope reports its superglobals and session to the cycle collector; $_SESSION is per scope like the other superglobals (a new scope has none, and it keeps its array after session_write_close(), session_abort() and session_destroy(), as in a request).</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
@@ -56,6 +56,8 @@
     <file name="localetz_stress.phpt" role="test"/>
     <file name="root.phpt" role="test"/>
     <file name="run.phpt" role="test"/>
+    <file name="before_first_scope.phpt" role="test"/>
+    <file name="generators_finally_yield.phpt" role="test"/>
     <file name="session_ini.phpt" role="test"/>
     <file name="session_destroy_cases.phpt" role="test"/>
     <file name="session_after_close.phpt" role="test"/>
