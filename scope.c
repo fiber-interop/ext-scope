@@ -41,7 +41,7 @@
 #include "ext/session/php_session.h"
 #include "scope_arginfo.h"
 
-#define PHP_SCOPE_VERSION "0.4.0"
+#define PHP_SCOPE_VERSION "0.4.1"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -144,6 +144,7 @@ typedef struct {
 #endif
 	zend_string *vars;
 	zval http_vars;
+	zval sym;   /* its $_SESSION, as the symbol table held it; UNDEF: no $_SESSION */
 	bool send_cookie;
 	bool define_sid;
 	bool in_save_handler;
@@ -521,6 +522,7 @@ static scope_sess *scope_sess_new(void)
 	ss->status = ss->mod ? php_session_none : php_session_disabled;
 	ss->define_sid = true;
 	ZVAL_UNDEF(&ss->http_vars);
+	ZVAL_UNDEF(&ss->sym);   /* a new request has no $_SESSION until session_start() */
 	for (int i = 0; i < SCOPE_SESS_INI_N; i++) {
 		zend_string *v = scope_sess_ini[i] ? scope_ini_initial(scope_sess_ini[i]) : NULL;
 		ss->ini[i] = v ? zend_string_copy(v) : NULL;
@@ -540,6 +542,7 @@ static void scope_sess_free(scope_sess *ss)
 	if (ss->started_file) zend_string_release(ss->started_file);
 #endif
 	zval_ptr_dtor(&ss->http_vars);
+	zval_ptr_dtor(&ss->sym);
 	for (size_t i = 0; i < sizeof(ss->user_names) / sizeof(zval); i++) {
 		zval_ptr_dtor(&names[i]);
 	}
@@ -553,7 +556,8 @@ static void scope_sess_free(scope_sess *ss)
 static void scope_sess_swap(scope_sess *from, scope_sess *to)
 {
 	php_session_status status;
-	zval *sym;
+	zval *sym, in = to->sym;
+	bool indirect;
 
 #define SCOPE_SESS_MOVE(f, g) from->f = scope_ps->g; scope_ps->g = to->f;
 	SCOPE_SESS_FIELDS(SCOPE_SESS_MOVE)
@@ -588,24 +592,29 @@ static void scope_sess_swap(scope_sess *from, scope_sess *to)
 	memset(to, 0, sizeof(*to));
 	ZVAL_UNDEF(&to->http_vars);
 
-	/* $_SESSION is ext/session's own symbol-table zval sharing http_session_vars' reference;
-	 * keep the two together, as session_start() does. Without a "_SESSION" entry, the next
-	 * session_start() creates it. While neither scope has session data, $_SESSION is an
-	 * ordinary global and is left alone. */
+	/* $_SESSION is the scope's own, as the other superglobals are: what the symbol table holds
+	 * (session_start() makes it a reference to http_session_vars, and it keeps its array after
+	 * session_write_close(), session_abort() or session_destroy(), as in a request) is moved
+	 * out, and the incoming scope's put in, or removed if it has none. */
 	sym = zend_hash_str_find(&EG(symbol_table), ZEND_STRL("_SESSION"));
-	if (sym && (!Z_ISUNDEF(from->http_vars) || !Z_ISUNDEF(scope_ps->http_session_vars))) {
-		zval old;
-
-		if (Z_TYPE_P(sym) == IS_INDIRECT) {
-			sym = Z_INDIRECT_P(sym);
-		}
-		old = *sym;
-		if (Z_ISUNDEF(scope_ps->http_session_vars)) {
-			ZVAL_NULL(sym);
+	indirect = sym && Z_TYPE_P(sym) == IS_INDIRECT;   /* a CV slot of {main}: emptied, never removed */
+	if (indirect) {
+		sym = Z_INDIRECT_P(sym);
+	}
+	if (sym && !Z_ISUNDEF_P(sym)) {
+		ZVAL_COPY_VALUE(&from->sym, sym);
+		ZVAL_UNDEF(sym);
+	} else {
+		ZVAL_UNDEF(&from->sym);
+	}
+	if (!Z_ISUNDEF(in)) {
+		if (sym) {
+			ZVAL_COPY_VALUE(sym, &in);
 		} else {
-			ZVAL_COPY(sym, &scope_ps->http_session_vars);
+			zend_hash_str_add_new(&EG(symbol_table), ZEND_STRL("_SESSION"), &in);
 		}
-		zval_ptr_dtor(&old);
+	} else if (sym && !indirect) {
+		zend_hash_str_del(&EG(symbol_table), ZEND_STRL("_SESSION"));   /* its value is UNDEF: nothing freed */
 	}
 }
 
@@ -1323,6 +1332,49 @@ static zend_object *scope_create(zend_class_entry *ce)
 	return &so->std;
 }
 
+/* A scope destroyed with its session still active writes and closes it here, in the destructor
+ * phase, because a save handler may be user code (session_set_save_handler()); free_obj is too
+ * late for that, e.g. inside gc_collect_cycles(). The engine calls this when the last reference
+ * goes, from the GC before it frees a cycle, and for every live object at request shutdown
+ * before RSHUTDOWN. An exception from the handler propagates as one from a destructor would. */
+static void scope_dtor(zend_object *obj)
+{
+	scope_object *so = SCOPE_OBJECT(obj);
+	if (so->sess && SCOPE_G(active) && SCOPE_G(applied) != obj) {
+		scope_sess *ss = so->sess;
+		so->sess = NULL;
+		scope_sess_end(ss);
+		efree(ss);
+	}
+	zend_objects_destroy_object(obj);
+}
+
+/* What a scope holds while it is not the applied one (the applied scope's values are in the
+ * live globals, and its stored ones are UNDEF): its superglobals, its $_SESSION and its user
+ * save handler. Reporting them lets the cycle collector free a cycle through them, such as a
+ * save handler that refers back to an object holding the scope. */
+static HashTable *scope_get_gc(zend_object *obj, zval **table, int *n)
+{
+	scope_object *so = SCOPE_OBJECT(obj);
+	zend_get_gc_buffer *buf = zend_get_gc_buffer_create();
+
+	if (so->sg) {
+		for (int i = 0; i < SCOPE_SG_N; i++) {
+			zend_get_gc_buffer_add_zval(buf, &so->sg[i]);
+		}
+	}
+	if (so->sess) {
+		zval *names = (zval *) &so->sess->user_names;
+		for (size_t i = 0; i < sizeof(so->sess->user_names) / sizeof(zval); i++) {
+			zend_get_gc_buffer_add_zval(buf, &names[i]);
+		}
+		zend_get_gc_buffer_add_zval(buf, &so->sess->http_vars);
+		zend_get_gc_buffer_add_zval(buf, &so->sess->sym);
+	}
+	zend_get_gc_buffer_use(buf, table, n);
+	return zend_std_get_properties(obj);
+}
+
 static void scope_free(zend_object *obj)
 {
 	scope_object *so = SCOPE_OBJECT(obj);
@@ -1333,11 +1385,7 @@ static void scope_free(zend_object *obj)
 	scope_sg_free(so->sg);
 	scope_tl_free(&so->tl);
 	if (so->sess) {
-		if (SCOPE_G(active) && SCOPE_G(applied) != obj) {
-			scope_sess_end(so->sess);   /* destroyed with its session still active: write and close it */
-		} else {
-			scope_sess_free(so->sess);
-		}
+		scope_sess_free(so->sess);   /* not ended by scope_dtor(): no user code runs here */
 		efree(so->sess);
 	}
 	if (so->state) {
@@ -1748,6 +1796,8 @@ static PHP_MINIT_FUNCTION(scope)
 	scope_ce = register_class_Scope();
 	memcpy(&scope_handlers, &std_object_handlers, sizeof(zend_object_handlers));
 	scope_handlers.offset = XtOffsetOf(scope_object, std);
+	scope_handlers.dtor_obj = scope_dtor;
+	scope_handlers.get_gc = scope_get_gc;
 	scope_handlers.free_obj = scope_free;
 	scope_handlers.clone_obj = NULL;   /* a scope is an identity: a copy would be another scope */
 	scope_ce->create_object = scope_create;
@@ -1838,9 +1888,12 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 		for (uint32_t i = 1; i < EG(objects_store).top; i++) {
 			zend_object *obj = EG(objects_store).object_buckets[i];
 			if (IS_OBJ_VALID(obj) && obj->ce == scope_ce && SCOPE_OBJECT(obj)->sess) {
-				scope_sess_end(SCOPE_OBJECT(obj)->sess);
-				efree(SCOPE_OBJECT(obj)->sess);
+				/* Detached first: ending it may release the last reference to this scope
+				 * (through the save handler or $_SESSION), and scope_free() must not see it. */
+				scope_sess *ss = SCOPE_OBJECT(obj)->sess;
 				SCOPE_OBJECT(obj)->sess = NULL;
+				scope_sess_end(ss);
+				efree(ss);
 			}
 		}
 	}
