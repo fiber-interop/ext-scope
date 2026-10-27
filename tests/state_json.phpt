@@ -3,6 +3,8 @@ Per-scope state (prototype): with scope.isolate_json_errors, json_last_error() i
 --EXTENSIONS--
 scope
 json
+--SKIPIF--
+<?php if (PHP_ZTS) die("skip the per-scope state prototype is NTS only"); ?>
 --INI--
 scope.isolate_json_errors=1
 --FILE--

@@ -4,6 +4,6 @@ PHP_ARG_ENABLE([scope],
   [yes])
 
 if test "$PHP_SCOPE" != "no"; then
-  PHP_NEW_EXTENSION(scope, scope.c, $ext_shared)
+  PHP_NEW_EXTENSION(scope, scope.c, $ext_shared,, -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1)
   PHP_ADD_MAKEFILE_FRAGMENT
 fi

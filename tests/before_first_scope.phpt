@@ -2,6 +2,8 @@
 Before the first Scope: object ids are as without the extension, and fibers and generators created then belong to the root
 --EXTENSIONS--
 scope
+--SKIPIF--
+<?php if (extension_loaded("parallel")) die("skip parallel allocates an object of its own at startup"); ?>
 --FILE--
 <?php
 var_dump(spl_object_id(new stdClass));   // the extension allocates no object of its own until a Scope exists

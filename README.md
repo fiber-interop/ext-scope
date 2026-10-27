@@ -40,6 +40,17 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Release 0.4.3
+
+0.4.3 builds and works on thread-safe (ZTS) PHP, where it previously did not compile. The session and the locale
+follow the scope there too, and new tests run scopes in several threads at once with the
+[parallel](https://github.com/krakjoe/parallel) extension; CI builds ZTS as well as NTS for PHP 8.2 to 8.5. It also
+fixes `unset($_GET)` (or any of the six) inside a scope, which removed the superglobal from every scope instead of only
+that one. Switching is cheaper: a superglobal that both scopes leave empty is not moved, the session is not moved when
+neither scope has one, and the C-side copies of the request arrays are updated without feeding the cycle collector. A
+fiber resumed from the root into another scope went from about 322 ns to about 260 ns (PHP 8.5, opcache on, JIT off);
+within one scope nothing changed.
+
 ## Release 0.4.2
 
 0.4.2 makes the session settings request-wide, as the RFC specifies: `session_name()`, `session_set_cookie_params()`,
@@ -229,7 +240,7 @@ scope.isolate_json_errors = 1
 
 With it, `json_last_error()` and `json_last_error_msg()` are per scope: a new scope starts with no
 error, the fibers of one scope share it, and requests no longer see each other's last error. Code
-outside any scope sees the global, as without the extension. Swapping costs roughly 25–55 ns per
+outside any scope sees the global, as without the extension. This prototype is built for NTS only; on ZTS builds the setting has no effect. Swapping costs roughly 25–55 ns per
 switch between fibers of different scopes; switches within one scope cost a pointer comparison.
 
 ## Build

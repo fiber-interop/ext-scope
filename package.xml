@@ -10,9 +10,9 @@
   <email>frode@ennerd.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-26</date>
+ <date>2026-10-27</date>
  <version>
-  <release>0.4.2</release>
+  <release>0.4.3</release>
   <api>0.4.0</api>
  </version>
  <stability>
@@ -20,7 +20,7 @@
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.4.2: session settings are request-wide, as the RFC specifies: session_name(), session_set_cookie_params(), session_cache_limiter() and ini_set() of session.* change them for every scope, and a new scope's save handler is the current session.save_handler; only the session itself (id, status, save handler state, $_SESSION) is per scope. Switching scopes is faster: a generator step that crosses scopes went from about 530 ns to about 230 ns (the locale is written only when it differs, and the superglobal entries are found through a cached bucket). The README notes that two scopes opening the same session id with a locking save handler (files, memcached, redis) deadlock the process.</notes>
+ <notes>0.4.3: builds and works on ZTS PHP (it did not compile there): ext/session's globals and the locale ini entry are reached per thread, and the session and locale follow the scope on ZTS too; thread tests with the parallel extension, and ZTS builds in CI. unset() of a superglobal inside a scope no longer removes it from every other scope. Switching scopes is cheaper: a superglobal that both scopes leave empty is not moved, nor is the session when neither scope has one, and the C-side copies of the request arrays are updated without feeding the cycle collector, which made it run every 10000 switches (a fiber resumed in another scope went from about 322 ns to about 260 ns).</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
@@ -83,6 +83,10 @@
     <file name="superglobals_server_switching.phpt" role="test"/>
     <file name="superglobals_sharing.phpt" role="test"/>
     <file name="superglobals_stress.phpt" role="test"/>
+    <file name="session_pristine_skip.phpt" role="test"/>
+    <file name="superglobals_empty_skip.phpt" role="test"/>
+    <file name="zts_parallel_boundaries.phpt" role="test"/>
+    <file name="zts_parallel_isolation.phpt" role="test"/>
    </dir>
   </dir>
  </contents>

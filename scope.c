@@ -41,7 +41,11 @@
 #include "ext/session/php_session.h"
 #include "scope_arginfo.h"
 
-#define PHP_SCOPE_VERSION "0.4.2"
+#if defined(ZTS) && defined(COMPILE_DL_SCOPE)
+ZEND_TSRMLS_CACHE_EXTERN()
+#endif
+
+#define PHP_SCOPE_VERSION "0.4.3"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -151,6 +155,7 @@ typedef struct {
 	zend_string *started_file;
 	uint32_t started_line;
 #endif
+	bool pristine;   /* as a request starts (scope_sess_live_pristine()); holds nothing but mod and status */
 } scope_sess;
 
 /* A Scope object, with its swapped globals and its slots (both allocated on first use). */
@@ -356,18 +361,28 @@ static zend_always_inline zval *scope_sg_live(int i)
 	return z;
 }
 
-/* A new scope's own arrays: empty, as a server's request starts before it seeds them. The
- * live entries are looked up anyway, so the first scope creation forces the lazily
- * created auto-globals (a later JIT callback would otherwise overwrite a scope's array). */
+/* A new scope's own arrays: empty, as a server's request starts before it seeds them. An
+ * empty array is stored as the engine's shared immutable one, so a switch between two scopes
+ * that both leave a superglobal empty has nothing to move for it. The live entries are looked
+ * up anyway, so the first scope creation forces the lazily created auto-globals (a later JIT
+ * callback would otherwise overwrite a scope's array). */
 static zval *scope_sg_new(void)
 {
 	zval *sg = ecalloc(SCOPE_SG_N, sizeof(zval));
 
 	for (int i = 0; i < SCOPE_SG_N; i++) {
 		scope_sg_live(i);
-		array_init(&sg[i]);
+		ZVAL_EMPTY_ARRAY(&sg[i]);
 	}
 	return sg;
+}
+
+/* An empty array that can't be told apart from a new one: no elements, the next append key
+ * still 0, and not a reference (code holding a reference to it must keep its array). */
+static zend_always_inline bool scope_sg_is_empty(zval *z)
+{
+	return Z_TYPE_P(z) == IS_ARRAY && (Z_ARR_P(z) == &zend_empty_array
+		|| (zend_hash_num_elements(Z_ARRVAL_P(z)) == 0 && Z_ARRVAL_P(z)->nNextFreeElement == ZEND_LONG_MIN));
 }
 
 static void scope_sg_free(zval *sg)
@@ -380,25 +395,71 @@ static void scope_sg_free(zval *sg)
 	}
 }
 
-/* Swap the live arrays for the incoming scope's: out goes into from[], in comes from to[]. */
+/* Swap the live arrays for the incoming scope's: out goes into from[], in comes from to[]. In
+ * the storage, UNDEF is a superglobal the scope has unset: the incoming scope's absence removes
+ * the live entry, and its array is put back when a scope that has one comes in. */
 static void scope_sg_swap(zval *from, zval *to)
 {
 	for (int i = 0; i < SCOPE_SG_N; i++) {
-		zval *live = scope_sg_live(i);   /* a cached bucket, checked by its key: a few compares */
+		zval *live = scope_symbol(i);   /* a cached bucket, checked by its key: a few compares */
+		bool indirect = live && Z_TYPE_P(live) == IS_INDIRECT;   /* a CV slot of {main} */
 
-		if (live == NULL || Z_TYPE(to[i]) == IS_UNDEF) {
+		if (indirect) {
+			live = Z_INDIRECT_P(live);
+		}
+		if (live && Z_ISUNDEF_P(live)) {
+			live = NULL;   /* an emptied CV slot is an unset variable */
+		}
+		if (live && scope_sg_is_empty(live) && Z_TYPE(to[i]) == IS_ARRAY && Z_ARR(to[i]) == &zend_empty_array) {
+			/* empty in both: the live array stays, and stands for the incoming scope's */
+			ZVAL_EMPTY_ARRAY(&from[i]);
 			continue;
 		}
-		ZVAL_COPY_VALUE(&from[i], live);
-		ZVAL_COPY_VALUE(live, &to[i]);
+		if (live == NULL) {
+			ZVAL_UNDEF(&from[i]);
+			if (Z_ISUNDEF(to[i])) {
+				continue;   /* unset in both */
+			}
+			live = scope_symbol(i);
+			if (live) {
+				live = Z_INDIRECT_P(live);   /* only a CV slot can be there and empty */
+				ZVAL_COPY_VALUE(live, &to[i]);
+			} else {
+				live = zend_hash_add_new(&EG(symbol_table), scope_sym_key[i], &to[i]);
+			}
+		} else {
+			if (scope_sg_is_empty(live)) {
+				zval_ptr_dtor(live);
+				ZVAL_EMPTY_ARRAY(&from[i]);
+			} else {
+				ZVAL_COPY_VALUE(&from[i], live);
+			}
+			if (Z_ISUNDEF(to[i])) {
+				ZVAL_UNDEF(live);
+				if (!indirect) {
+					zend_hash_del(&EG(symbol_table), scope_sym_key[i]);   /* its value is UNDEF: nothing freed */
+				}
+				live = NULL;
+			} else {
+				ZVAL_COPY_VALUE(live, &to[i]);
+			}
+		}
 		ZVAL_UNDEF(&to[i]);
 		if (scope_sg_track[i] >= 0) {
-			/* C code (ext/session's cookie lookup, browscap, zlib, ...) reads PG(http_globals) */
+			/* C code (ext/session's cookie lookup, browscap, zlib, ...) reads PG(http_globals);
+			 * a scope that has unset the superglobal shows it an empty array */
 			zval *pg = &PG(http_globals)[scope_sg_track[i]];
 			zval old = *pg;
 
-			ZVAL_COPY(pg, live);
-			i_zval_ptr_dtor(&old);
+			if (live) {
+				ZVAL_COPY(pg, live);
+			} else {
+				ZVAL_EMPTY_ARRAY(pg);
+			}
+			/* without the cycle collector: the old array is still held by the outgoing scope's
+			 * storage, and buffering it as a possible root at every switch made the collector
+			 * run, and scan these arrays, every 10000 switches */
+			zval_ptr_dtor_nogc(&old);
 		}
 	}
 }
@@ -522,11 +583,17 @@ static void scope_tl_swap(scope_tl *from, scope_tl *to)
  * ext/session's per-request globals (the PS() fields its RINIT/RSHUTDOWN reset) are moved
  * between the live globals and the scope's storage at every switch, the way the phasync
  * extension's sapi() swaps them per request. ext/session is optional: scope_ps is NULL
- * without it (or on ZTS builds), and nothing is swapped. The session is isolated, its
+ * without it, and nothing is swapped. The session is isolated, its
  * settings are not: the session.* ini entries, and session_name(), session_set_cookie_params()
  * and the others that write them, stay request-wide, as ini_set() does. */
 
+static zend_module_entry *scope_session_module;   /* NULL: ext/session is not loaded, or another build of it */
+#ifdef ZTS
+# define scope_ps (scope_session_module \
+	? TSRMG_BULK_STATIC(*scope_session_module->globals_id_ptr, php_ps_globals *) : NULL)
+#else
 static php_ps_globals *scope_ps;
+#endif
 
 #define SCOPE_SESS_ON() (SCOPE_G(session) && scope_ps != NULL)
 
@@ -560,6 +627,7 @@ static scope_sess *scope_sess_new(void)
 	ss->define_sid = true;
 	ZVAL_UNDEF(&ss->http_vars);
 	ZVAL_UNDEF(&ss->sym);   /* a new request has no $_SESSION until session_start() */
+	ss->pristine = true;
 	return ss;
 }
 
@@ -583,17 +651,58 @@ static void scope_sess_free(scope_sess *ss)
 }
 
 /* Move the live session state into from and to's into the live globals (to is left empty). */
+/* Whether ext/session's live state is as a request starts: no session started, no handler of
+ * its own, nothing kept from an earlier session. Every field of SCOPE_SESS_FIELDS is checked
+ * except the module, which the caller compares. */
+static zend_always_inline bool scope_sess_live_pristine(void)
+{
+	php_ps_globals *p = scope_ps;
+	zval *names = (zval *) &p->mod_user_names;
+
+	if (p->id || p->mod_data || p->mod_user_implemented || p->mod_user_is_open || p->mod_user_class_name
+		|| p->session_vars || !Z_ISUNDEF(p->http_session_vars) || p->send_cookie || !p->define_sid
+		|| p->in_save_handler || p->set_handler
+		|| p->session_status != (p->mod ? php_session_none : php_session_disabled)) {
+		return false;
+	}
+#if PHP_VERSION_ID >= 80600
+	if (p->mod_user_uses_object_methods_as_handlers) {
+		return false;
+	}
+#endif
+#if PHP_VERSION_ID >= 80300
+	if (p->session_started_filename || p->session_started_lineno) {
+		return false;
+	}
+#endif
+	for (size_t i = 0; i < sizeof(p->mod_user_names) / sizeof(zval); i++) {
+		if (!Z_ISUNDEF(names[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static void scope_sess_swap(scope_sess *from, scope_sess *to)
 {
 	zval *sym, in = to->sym;
-	bool indirect;
+	bool indirect, live_pristine = scope_sess_live_pristine();
 
+	if (live_pristine && to->pristine && to->mod == scope_ps->mod) {
+		/* neither scope has a session: the live state stands for the incoming one too */
+		from->pristine = true;
+		from->mod = scope_ps->mod;
+		from->status = scope_ps->session_status;
+		from->define_sid = true;
+		ZVAL_UNDEF(&to->sym);
+	} else {
 #define SCOPE_SESS_MOVE(f, g) from->f = scope_ps->g; scope_ps->g = to->f;
-	SCOPE_SESS_FIELDS(SCOPE_SESS_MOVE)
+		SCOPE_SESS_FIELDS(SCOPE_SESS_MOVE)
 #undef SCOPE_SESS_MOVE
-
-	memset(to, 0, sizeof(*to));
-	ZVAL_UNDEF(&to->http_vars);
+		from->pristine = live_pristine;
+		memset(to, 0, sizeof(*to));
+		ZVAL_UNDEF(&to->http_vars);
+	}
 
 	/* $_SESSION is the scope's own, as the other superglobals are: what the symbol table holds
 	 * (session_start() makes it a reference to http_session_vars, and it keeps its array after
@@ -625,7 +734,7 @@ static void scope_sess_swap(scope_sess *from, scope_sess *to)
  * an active session, then free the state. The scope must not be the applied one. */
 static void scope_sess_end(scope_sess *ss)
 {
-	scope_sess live;
+	scope_sess live = {0};
 
 	if (ss->status == php_session_active || ss->mod_data || ss->user_implemented) {
 		scope_sess_swap(&live, ss);
@@ -1808,15 +1917,15 @@ static PHP_MINIT_FUNCTION(scope)
 	if (scope_date_module == NULL) {
 		return FAILURE;
 	}
-	SCOPE_G(loc_ini) = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("intl.default_locale"));
-#ifndef ZTS
 	{
 		zend_module_entry *session = zend_hash_str_find_ptr(&module_registry, ZEND_STRL("session"));
 		if (session && session->globals_size == sizeof(php_ps_globals)) {
+			scope_session_module = session;
+#ifndef ZTS
 			scope_ps = session->globals_ptr;
+#endif
 		}
 	}
-#endif
 	for (int i = 0; i < SCOPE_SG_N; i++) {
 		scope_sym_key[i] = zend_string_init_interned(scope_sg_names[i], strlen(scope_sg_names[i]), 1);
 	}
@@ -1877,6 +1986,8 @@ static PHP_RINIT_FUNCTION(scope)
 #endif
 	zval null;
 
+	/* looked up per request: under ZTS every thread has its own ini table */
+	SCOPE_G(loc_ini) = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("intl.default_locale"));
 	ZVAL_NULL(&null);
 	ZVAL_ARR(&SCOPE_G(main), scope_array_new(&null));
 	SCOPE_G(cur) = Z_ARR(SCOPE_G(main));
