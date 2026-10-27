@@ -12,7 +12,7 @@
  </lead>
  <date>2026-10-27</date>
  <version>
-  <release>0.4.3</release>
+  <release>0.4.4</release>
   <api>0.4.0</api>
  </version>
  <stability>
@@ -20,7 +20,7 @@
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.4.3: builds and works on ZTS PHP (it did not compile there): ext/session's globals and the locale ini entry are reached per thread, and the session and locale follow the scope on ZTS too; thread tests with the parallel extension, and ZTS builds in CI. unset() of a superglobal inside a scope no longer removes it from every other scope. Switching scopes is cheaper: a superglobal that both scopes leave empty is not moved, nor is the session when neither scope has one, and the C-side copies of the request arrays are updated without feeding the cycle collector, which made it run every 10000 switches (a fiber resumed in another scope went from about 322 ns to about 260 ns).</notes>
+ <notes>0.4.4: a session whose save handler locks (files; memcached and redis with session locking on; a user handler built on SessionHandler over one of these) is open in one scope of a process at a time: session_start() throws a RuntimeException, whose message does not contain the id, when the session id is open in another scope of the process, instead of blocking the process on a lock only that scope can release. A lock held by another process or thread is waited for as before; other user handlers are not affected; read_and_close is not applied implicitly.</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
@@ -83,6 +83,7 @@
     <file name="superglobals_server_switching.phpt" role="test"/>
     <file name="superglobals_sharing.phpt" role="test"/>
     <file name="superglobals_stress.phpt" role="test"/>
+    <file name="session_lock_conflict.phpt" role="test"/>
     <file name="session_pristine_skip.phpt" role="test"/>
     <file name="superglobals_empty_skip.phpt" role="test"/>
     <file name="zts_parallel_boundaries.phpt" role="test"/>

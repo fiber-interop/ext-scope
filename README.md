@@ -40,6 +40,13 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Release 0.4.4
+
+0.4.4 implements the session locking rule of the Scope RFC 0.9.3: a session whose save handler locks it is open in
+one scope of a process at a time, and `session_start()` throws a `RuntimeException` when the session id is open in
+another scope, instead of blocking the whole process on a lock only that scope can release (see the session section
+below).
+
 ## Release 0.4.3
 
 0.4.3 builds and works on thread-safe (ZTS) PHP, where it previously did not compile. The session and the locale
@@ -162,15 +169,18 @@ When ext/session is loaded (it is an optional dependency), its request state fol
   still alive, before ext/session's own shutdown handles the root's. An exception from the handler propagates as one
   from a destructor. `Scope` reports its superglobals, `$_SESSION` and save handler to the cycle collector.
 
-- **Locking handlers block the process.** The files handler holds an `flock()` on the session file while the session
-  is open, and other handlers (memcached, redis) lock too. Two scopes in one process that open the same session id
-  at once (a browser's parallel requests do) deadlock: the second `session_start()` waits for a lock only the first
-  scope can release, and that scope can't run while the process waits. Under php-fpm or ZTS the second request
-  waits in its own process or thread instead. A server that runs requests as scopes needs a handler that waits
-  cooperatively, or must not open the same session id in two scopes at once.
+- **A locking session is open in one scope of a process at a time.** The files handler holds an `flock()` on the
+  session file while the session is open, and memcached and redis lock too when their session locking is on. If two
+  scopes in one process opened the same session id at once (a browser's parallel requests do), the second
+  `session_start()` would wait for a lock only the first scope can release, while that scope can't run. Instead,
+  `session_start()` throws a `RuntimeException` when the session id is open in another scope of the process and the
+  save handler locks; the message does not contain the id. A user handler built on `SessionHandler` locks when the
+  handler it wraps does; other user handlers are taken not to lock, and behave as under php-fpm. A lock held by
+  another process or thread is waited for as before. `read_and_close` does not avoid the error while the other scope
+  holds the session, because reading takes the lock; it is not applied implicitly. The application or its runtime
+  decides what to do, for example retry after the other scope closes the session.
 
 `scope.session` (default `1`, `PHP_INI_SYSTEM`) turns only this off; it is also off when `scope.superglobals=0`.
-The session is not swapped on ZTS builds.
 
 ## Default locale and timezone (secondary vote B)
 

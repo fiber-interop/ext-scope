@@ -39,13 +39,14 @@
 #include "ext/json/php_json.h"
 #include "ext/date/php_date.h"
 #include "ext/session/php_session.h"
+#include "ext/spl/spl_exceptions.h"
 #include "scope_arginfo.h"
 
 #if defined(ZTS) && defined(COMPILE_DL_SCOPE)
 ZEND_TSRMLS_CACHE_EXTERN()
 #endif
 
-#define PHP_SCOPE_VERSION "0.4.3"
+#define PHP_SCOPE_VERSION "0.4.4"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -181,6 +182,8 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	bool session;           /* INI scope.session */
 	scope_sess root_sess;   /* the root scope's session while another scope is applied */
 	HashTable bound;        /* the data of the closures Scope::bind() returned */
+	HashTable sess_scopes;  /* obj handle => the Scope objects that keep a session state of their own */
+	const ps_module *sess_real; /* while session_start() runs through a lock check: the real save handler */
 	scope_tl root_tl;       /* the root scope's timezone and locale while another scope is applied */
 	zend_ini_entry *loc_ini; /* intl.default_locale; NULL when intl is not loaded */
 	zend_string *loc_initial; /* the locale a new scope starts with: the ini value, or ICU's default at RINIT if unset */
@@ -728,6 +731,109 @@ static void scope_sess_swap(scope_sess *from, scope_sess *to)
 	} else if (sym && !indirect) {
 		zend_hash_del(&EG(symbol_table), scope_sym_key[SCOPE_SYM_SESSION]);   /* its value is UNDEF: nothing freed */
 	}
+}
+
+/* A session whose save handler locks it while it is open can be active in only one scope of a
+ * process at a time: a second scope reading it would wait for a lock that only the first scope
+ * can release, and the first cannot run while the process waits. session_start() runs with a
+ * copy of the save handler whose read checks for that first, and throws instead of blocking. A
+ * lock held by another process or thread is not affected, and handlers that do not lock behave
+ * as under php-fpm. */
+static bool scope_sess_mod_locks(const ps_module *mod)
+{
+	zend_string *v;
+
+	if (mod == NULL) {
+		return false;
+	}
+	if (strcmp(mod->s_name, "files") == 0) {
+		return true;
+	}
+	if (strcmp(mod->s_name, "redis") == 0 || strcmp(mod->s_name, "rediscluster") == 0) {
+		v = zend_ini_str_ex(ZEND_STRL("redis.session.locking_enabled"), false, NULL);
+		return v && zend_ini_parse_bool(v);
+	}
+	if (strcmp(mod->s_name, "memcached") == 0) {
+		v = zend_ini_str_ex(ZEND_STRL("memcached.sess_locking"), false, NULL);
+		return v && zend_ini_parse_bool(v);
+	}
+	return false;
+}
+
+/* With a user save handler, one built on SessionHandler reads through the handler it wraps
+ * (ext/session's default_mod), and locks when that one does. Other user handlers are taken
+ * not to lock. names: the user handler's callables, read third ([object, "read"] for objects). */
+static bool scope_sess_locks(const ps_module *mod, zval *names)
+{
+	if (mod && strcmp(mod->s_name, "user") == 0) {
+		zval *read = &names[2], *obj;
+
+		if (Z_TYPE_P(read) == IS_ARRAY && (obj = zend_hash_index_find(Z_ARRVAL_P(read), 0))
+			&& Z_TYPE_P(obj) == IS_OBJECT && instanceof_function(Z_OBJCE_P(obj), php_session_class_entry)) {
+			return scope_sess_mod_locks(scope_ps->default_mod);
+		}
+		return false;
+	}
+	return scope_sess_mod_locks(mod);
+}
+
+static bool scope_sess_held(scope_sess *ss, zend_string *key)
+{
+	return ss->status == php_session_active && ss->id && zend_string_equals(ss->id, key)
+		&& scope_sess_locks(ss->mod, (zval *) &ss->user_names);
+}
+
+/* Whether another scope of this process holds the session key open with a locking handler. */
+static bool scope_sess_held_elsewhere(zend_string *key)
+{
+	zend_object *obj;
+
+	if (SCOPE_G(applied) != NULL && scope_sess_held(&SCOPE_G(root_sess), key)) {
+		return true;
+	}
+	ZEND_HASH_FOREACH_PTR(&SCOPE_G(sess_scopes), obj) {
+		scope_sess *ss = SCOPE_OBJECT(obj)->sess;
+		if (obj != SCOPE_G(applied) && ss && scope_sess_held(ss, key)) {
+			return true;
+		}
+	} ZEND_HASH_FOREACH_END();
+	return false;
+}
+
+static zend_result scope_sess_checked_read(PS_READ_ARGS)
+{
+	if (scope_sess_held_elsewhere(key)) {
+		/* the id is a secret: it is not part of the message */
+		zend_throw_exception(spl_ce_RuntimeException,
+			"session_start(): the session is open in another scope of this process, and its save handler "
+			"locks it; starting it here would block the process", 0);
+		return FAILURE;
+	}
+	return SCOPE_G(sess_real)->s_read(mod_data, key, val, maxlifetime);
+}
+
+static zif_handler scope_orig_session_start;
+
+/* session_start(), with the save handler's read checked first when the handler locks */
+static ZEND_NAMED_FUNCTION(scope_session_start)
+{
+	const ps_module *mod = scope_ps ? scope_ps->mod : NULL;
+	ps_module proxy;
+
+	if (!SCOPE_SESS_ON() || !SCOPE_G(active) || Z_ISUNDEF(SCOPE_G(members))
+		|| !scope_sess_locks(mod, (zval *) &scope_ps->mod_user_names)) {
+		scope_orig_session_start(INTERNAL_FUNCTION_PARAM_PASSTHRU);   /* no other scope exists, or no lock */
+		return;
+	}
+	proxy = *mod;
+	proxy.s_read = scope_sess_checked_read;
+	SCOPE_G(sess_real) = mod;
+	scope_ps->mod = &proxy;
+	scope_orig_session_start(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	if (scope_ps->mod == &proxy) {
+		scope_ps->mod = mod;
+	}
+	SCOPE_G(sess_real) = NULL;
 }
 
 /* The end of a scope's session, as ext/session's RSHUTDOWN ends a request's: write and close
@@ -1465,6 +1571,7 @@ static zend_object *scope_create(zend_class_entry *ce)
 	}
 	if (SCOPE_G(superglobals) && SCOPE_SESS_ON() && SCOPE_G(active)) {
 		so->sess = scope_sess_new();
+		zend_hash_index_add_new_ptr(&SCOPE_G(sess_scopes), so->std.handle, &so->std);
 	}
 	return &so->std;
 }
@@ -1480,6 +1587,7 @@ static void scope_dtor(zend_object *obj)
 	if (so->sess && SCOPE_G(active) && SCOPE_G(applied) != obj) {
 		scope_sess *ss = so->sess;
 		so->sess = NULL;
+		zend_hash_index_del(&SCOPE_G(sess_scopes), obj->handle);
 		scope_sess_end(ss);
 		efree(ss);
 	}
@@ -1524,6 +1632,7 @@ static void scope_free(zend_object *obj)
 	if (so->sess) {
 		scope_sess_free(so->sess);   /* not ended by scope_dtor(): no user code runs here */
 		efree(so->sess);
+		zend_hash_index_del(&SCOPE_G(sess_scopes), obj->handle);
 	}
 	if (so->state) {
 		for (size_t i = 0; i < scope_states_n; i++) {
@@ -1930,6 +2039,13 @@ static PHP_MINIT_FUNCTION(scope)
 		scope_sym_key[i] = zend_string_init_interned(scope_sg_names[i], strlen(scope_sg_names[i]), 1);
 	}
 	scope_sym_key[SCOPE_SYM_SESSION] = zend_string_init_interned("_SESSION", sizeof("_SESSION") - 1, 1);
+	if (scope_session_module) {
+		zend_function *f = zend_hash_str_find_ptr(CG(function_table), ZEND_STRL("session_start"));
+		if (f && f->type == ZEND_INTERNAL_FUNCTION) {
+			scope_orig_session_start = f->internal_function.handler;
+			f->internal_function.handler = scope_session_start;
+		}
+	}
 	scope_ce = register_class_Scope();
 	memcpy(&scope_handlers, &std_object_handlers, sizeof(zend_object_handlers));
 	scope_handlers.offset = XtOffsetOf(scope_object, std);
@@ -2003,6 +2119,8 @@ static PHP_RINIT_FUNCTION(scope)
 	memset(&SCOPE_G(root_tl), 0, sizeof(SCOPE_G(root_tl)));
 	memset(&SCOPE_G(root_sess), 0, sizeof(SCOPE_G(root_sess)));
 	zend_hash_init(&SCOPE_G(bound), 8, NULL, scope_bound_dtor, 0);
+	zend_hash_init(&SCOPE_G(sess_scopes), 8, NULL, NULL, 0);
+	SCOPE_G(sess_real) = NULL;
 	if (SCOPE_G(locale_timezone)) {
 		scope_tl_save(&SCOPE_G(root_tl));
 		scope_tl_startup();
@@ -2033,12 +2151,14 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 				 * (through the save handler or $_SESSION), and scope_free() must not see it. */
 				scope_sess *ss = SCOPE_OBJECT(obj)->sess;
 				SCOPE_OBJECT(obj)->sess = NULL;
+				zend_hash_index_del(&SCOPE_G(sess_scopes), obj->handle);
 				scope_sess_end(ss);
 				efree(ss);
 			}
 		}
 	}
 	zend_hash_destroy(&SCOPE_G(bound));
+	zend_hash_destroy(&SCOPE_G(sess_scopes));
 	if (SCOPE_G(root_state)) {
 		efree(SCOPE_G(root_state));
 		SCOPE_G(root_state) = NULL;
