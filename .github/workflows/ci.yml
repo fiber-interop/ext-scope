@@ -26,11 +26,15 @@ jobs:
           phpts: ${{ matrix.ts }}
       - name: Build
         run: phpize && ./configure && make -j"$(nproc)"
-      - name: make test
+      - name: Tests
+        # run-tests.php with the PHP's own ini (make test runs with -n), so intl and, on ZTS,
+        # parallel are loaded and the locale and thread tests run instead of skipping
         run: |
-          make test NO_INTERACTION=1 REPORT_EXIT_STATUS=1 TESTS="--show-diff tests" | tee test.log
+          php run-tests.php -P -q --no-color --show-diff -d extension=$PWD/modules/scope.so tests/ | tee test.log
+          grep -Eq '^Tests failed +: +0 ' test.log
           # A build that fails to load runs zero tests and still reports zero failures.
           grep -Eq '^Tests passed +: +[1-9]' test.log
           php -d extension=modules/scope.so -r 'var_dump(Scope::getCurrent() === Scope::getRootScope());' | grep -q 'bool(true)'
-          # on ZTS the thread tests must have run, not been skipped
-          if [ "${{ matrix.ts }}" = zts ]; then grep -Eq '^PASS .*zts_parallel_isolation' test.log && grep -Eq '^PASS .*zts_parallel_boundaries' test.log; fi
+          # the locale tests must have run, and on ZTS the thread tests too
+          grep -Eq 'PASS .*\[tests/localetz_locale_isolation.phpt\]' test.log
+          if [ "${{ matrix.ts }}" = zts ]; then grep -Eq 'PASS .*\[tests/zts_parallel_isolation.phpt\]' test.log && grep -Eq 'PASS .*\[tests/zts_parallel_boundaries.phpt\]' test.log; fi
