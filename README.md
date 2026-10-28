@@ -40,6 +40,23 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Release 0.5.0
+
+0.5.0 adds `Scope::__run_without()`, which is not part of the RFC: an event loop running in a scope of its own keeps
+that scope out of the state switching (see below). Switching is cheaper: the superglobals are moved between the
+symbol table and the scopes without being compared (copy-on-write makes the entry hold the outgoing scope's current
+array), the per-fiber bookkeeping skips its hash table when a fiber goes back to the scope it came from, and a
+missing `$_SESSION` costs no lookup. A fiber resumed from the root into another scope went from about 83 ns to about
+66 ns of extra cost per switch (PHP 8.5, `php -n`). Fixes:
+
+- C code reading the request arrays (`ob_gzhandler()`'s Accept-Encoding lookup, browscap, ext/session) crashed when a
+  scope had made a superglobal a reference (`$s = &$_SERVER`) or a non-array (`$_SERVER = 1`) before a switch;
+- a new scope dropped a save handler module another extension had put in place of ext/session's own of the same name
+  (ext-phasync's cooperative `files` handler), so `session_start()` inside a scope blocked the process on a lock
+  another process held;
+- a superglobal deleted from the end of the symbol table, followed by a new global variable in the freed slot, could
+  be taken for the superglobal at the next switch.
+
 ## Release 0.4.4
 
 0.4.4 implements the session locking rule of the Scope RFC 0.9.3: a session whose save handler locks it is open in
@@ -252,6 +269,36 @@ With it, `json_last_error()` and `json_last_error_msg()` are per scope: a new sc
 error, the fibers of one scope share it, and requests no longer see each other's last error. Code
 outside any scope sees the global, as without the extension. This prototype is built for NTS only; on ZTS builds the setting has no effect. Swapping costs roughly 25–55 ns per
 switch between fibers of different scopes; switches within one scope cost a pointer comparison.
+
+## Event loops: `Scope::__run_without()` (not part of the RFC)
+
+```php
+public static function Scope::__run_without(callable $callback, mixed ...$args): mixed;
+```
+
+An event loop resumes a fiber of one request, gets control back, and resumes the next: every round trip switches
+the state of the loop's scope in and out. A loop that runs in a scope of its own can skip that. While `$callback`
+runs, switching to the calling scope does not apply its superglobals, session, locale and timezone: the state of the
+scope that ran before it stays live. Loop → fiber in A → loop → fiber in A then switches no state, and loop → A →
+loop → B switches once instead of twice. `Scope::getCurrent()` still returns the loop's scope, and fibers and
+generators keep theirs; only the state is not applied. When `$callback` returns or throws, the loop's state is
+applied again. A scope whose state is live when it is destroyed gives it back first.
+
+```php
+$loopScope = new Scope();
+$loopScope->run(fn() => Scope::__run_without(fn() => $loop->run()));
+```
+
+The cost is a rule for the loop: code running in its scope sees, and writes to, whichever scope's state is live. Timer
+and stream callbacks that run in the loop's own frame must not use the superglobals, the session or the default
+timezone. It throws from the root scope (code outside any scope must keep its own state) and when it is already
+running. The engine implementation proposed by the RFC switches scopes with a few pointer stores, so this has no
+counterpart there. Measured with a loop resuming fibers that each run in a scope (PHP 8.5, `php -n`):
+
+| | Loop in its own scope | With `__run_without()` |
+|---|---|---|
+| Fibers of one scope | ~40 ns per switch | ~0 ns |
+| Fibers of two scopes, alternating | ~44 ns per switch | ~14 ns |
 
 ## Build
 

@@ -10,17 +10,17 @@
   <email>frode@ennerd.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-27</date>
+ <date>2026-10-28</date>
  <version>
-  <release>0.4.4</release>
-  <api>0.4.0</api>
+  <release>0.5.0</release>
+  <api>0.5.0</api>
  </version>
  <stability>
   <release>alpha</release>
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.4.4: a session whose save handler locks (files; memcached and redis with session locking on; a user handler built on SessionHandler over one of these) is open in one scope of a process at a time: session_start() throws a RuntimeException, whose message does not contain the id, when the session id is open in another scope of the process, instead of blocking the process on a lock only that scope can release. A lock held by another process or thread is waited for as before; other user handlers are not affected; read_and_close is not applied implicitly.</notes>
+ <notes>0.5.0: Scope::__run_without(), not part of the RFC, lets an event loop running in a scope of its own keep that scope out of the state switching. Scope switches are cheaper (the superglobals are moved without being compared, and the per-fiber bookkeeping and a missing $_SESSION cost no lookups). Fixes: a crash in C code reading the request arrays after a scope made a superglobal a reference or a non-array; a new scope dropping a save handler module another extension had put in place of ext/session's; a superglobal deleted from the end of the symbol table being confused with the variable added after it.</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
@@ -88,6 +88,9 @@
     <file name="superglobals_empty_skip.phpt" role="test"/>
     <file name="zts_parallel_boundaries.phpt" role="test"/>
     <file name="zts_parallel_isolation.phpt" role="test"/>
+    <file name="run_without.phpt" role="test"/>
+    <file name="superglobal_reference_switch.phpt" role="test"/>
+    <file name="superglobal_bucket_reused.phpt" role="test"/>
    </dir>
   </dir>
  </contents>

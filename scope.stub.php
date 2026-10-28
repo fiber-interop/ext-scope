@@ -38,4 +38,11 @@ final class Scope
 
     /** The root scope: one object for the whole request, current in {main} outside any run(). */
     public static function getRootScope(): Scope {}
+
+    /**
+     * Not part of the RFC: for an event loop running in a scope of its own. While $callback
+     * runs, switching to the calling scope does not apply its superglobals, session, locale and
+     * timezone; the state of the scope that ran before stays live. Throws from the root scope.
+     */
+    public static function __run_without(callable $callback, mixed ...$args): mixed {}
 }

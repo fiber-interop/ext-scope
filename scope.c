@@ -46,7 +46,7 @@
 ZEND_TSRMLS_CACHE_EXTERN()
 #endif
 
-#define PHP_SCOPE_VERSION "0.4.4"
+#define PHP_SCOPE_VERSION "0.5.0"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -195,6 +195,14 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	zend_array *cur;        /* the array of the code running now */
 	zval members;           /* WeakMap: Fiber|Generator => its array */
 	HashTable ctx_cur;      /* (uintptr_t)zend_fiber_context => zend_array* of the code it was running */
+	/* ctx_cur's two most recent entries, for the usual A -> B -> A: the context switched in last
+	 * and the array it got (in_cur: still its entry unless it changed scope since), and the one
+	 * switched out last with the array stored for it. NULL: not known. */
+	zend_fiber_context *in_ctx, *out_ctx;
+	/* Scope::__run_without(): while its callback runs, this scope's state is not applied when it
+	 * becomes current; the state of the scope applied before stays live. NULL: none. */
+	zend_object *skip;
+	zend_array *in_cur, *out_cur;
 	HashTable ctx_owned;    /* arrays of fiber contexts that aren't Fiber objects */
 	zend_array *resumer;    /* the array of the code resuming a generator now; NULL: none */
 	HashTable ctx_resumer;  /* (uintptr_t)zend_fiber_context => its resumer while it is not running */
@@ -202,6 +210,11 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	zend_array *gen_last_a;
 	Bucket *sym_cache[7];   /* symbol-table buckets of the six superglobals and $_SESSION (see scope_symbol()) */
 	zend_string *sym_cache_key[7];   /* the key each of those buckets had when found */
+	Bucket *sym_ar;          /* EG(symbol_table)'s layout when sym_known was last cleared: */
+	uint32_t sym_used, sym_size;
+	zend_string *sym_tail_key;  /* and its last bucket's key and hash: a deletion of the last */
+	zend_ulong sym_tail_h;      /* bucket and an addition put back the same layout, but not these */
+	uint8_t sym_known;       /* bit i: sym_cache[i] (NULL: absent) is right for that layout */
 ZEND_END_MODULE_GLOBALS(scope)
 
 ZEND_DECLARE_MODULE_GLOBALS(scope)
@@ -326,11 +339,29 @@ static zend_string *scope_sym_key[SCOPE_SG_N + 1];
 /* A variable's entry in the global symbol table. The bucket found last time is reused while
  * it still holds that variable (inside the table, same key, not deleted); a resize
  * or compaction that moved it falls back to a lookup with the precomputed hash. NULL: absent. */
+static zend_always_inline bool scope_sym_layout_same(HashTable *ht)
+{
+	return ht->arData == SCOPE_G(sym_ar) && ht->nNumUsed == SCOPE_G(sym_used) && ht->nTableSize == SCOPE_G(sym_size)
+		&& (ht->nNumUsed == 0 || (ht->arData[ht->nNumUsed - 1].key == SCOPE_G(sym_tail_key)
+			&& ht->arData[ht->nNumUsed - 1].h == SCOPE_G(sym_tail_h)));
+}
+
 static zend_always_inline zval *scope_symbol(int i)
 {
 	HashTable *ht = &EG(symbol_table);
 	Bucket *b = SCOPE_G(sym_cache)[i];
 	zval *z;
+
+	if (!scope_sym_layout_same(ht)) {
+		SCOPE_G(sym_ar) = ht->arData;
+		SCOPE_G(sym_used) = ht->nNumUsed;
+		SCOPE_G(sym_size) = ht->nTableSize;
+		SCOPE_G(sym_tail_key) = ht->nNumUsed ? ht->arData[ht->nNumUsed - 1].key : NULL;
+		SCOPE_G(sym_tail_h) = ht->nNumUsed ? ht->arData[ht->nNumUsed - 1].h : 0;
+		SCOPE_G(sym_known) = 0;
+	} else if (b == NULL && (SCOPE_G(sym_known) & (1u << i))) {
+		return NULL;   /* found absent in this layout: nothing was added since */
+	}
 
 	/* The bucket's key is compared with the key it had when found: by pointer, because the
 	 * table's key may be another string than ours (opcache moves interned strings to shared
@@ -345,6 +376,7 @@ static zend_always_inline zval *scope_symbol(int i)
 		SCOPE_G(sym_cache)[i] = b;
 		SCOPE_G(sym_cache_key)[i] = b ? b->key : NULL;
 	}
+	SCOPE_G(sym_known) |= 1u << i;   /* found, or found absent, in this layout */
 	return z;
 }
 
@@ -401,9 +433,58 @@ static void scope_sg_free(zval *sg)
 /* Swap the live arrays for the incoming scope's: out goes into from[], in comes from to[]. In
  * the storage, UNDEF is a superglobal the scope has unset: the incoming scope's absence removes
  * the live entry, and its array is put back when a scope that has one comes in. */
-static void scope_sg_swap(zval *from, zval *to)
+static zend_never_inline void scope_sg_swap_one(int i, zval *from, zval *to);
+
+void scope_sg_swap(zval *from, zval *to)
 {
+	HashTable *ht = &EG(symbol_table);
+
+	/* The usual switch: the symbol table as at the last switch (nothing added, nothing moved),
+	 * the six entries plain arrays in it and in the incoming scope's storage. Copy-on-write
+	 * makes a move enough: a write by the outgoing scope's code put a new array in the entry,
+	 * so the entry holds that scope's current array. The two arrays change places, ownership
+	 * and all, and http_globals is pointed at the incoming ones. Nothing is compared. */
+	Bucket *const *b = SCOPE_G(sym_cache);
+	bool cached = scope_sym_layout_same(ht) && (SCOPE_G(sym_known) & 0x3f) == 0x3f;
+
 	for (int i = 0; i < SCOPE_SG_N; i++) {
+		/* The usual entry: the symbol table as at the last switch, the entry a plain array in
+		 * it and in the incoming scope's storage. Copy-on-write makes a move enough: a write by
+		 * the outgoing scope's code put a new array in the entry, so the entry holds that
+		 * scope's current array. Nothing is compared. */
+		if (EXPECTED(cached && b[i] && Z_TYPE(b[i]->val) == IS_ARRAY && Z_TYPE(to[i]) == IS_ARRAY)) {
+			zval *live = &b[i]->val;
+
+			if (scope_sg_is_empty(live) && scope_sg_is_empty(&to[i])) {
+				/* empty both sides (and never appended to: $a[] would give the same key), so
+				 * one is as good as the other: live stays */
+				from[i] = to[i];
+				ZVAL_UNDEF(&to[i]);
+				continue;
+			}
+			from[i] = *live;
+			*live = to[i];   /* type flags and all: the shared empty array is not refcounted */
+			ZVAL_UNDEF(&to[i]);
+			if (scope_sg_track[i] >= 0) {
+				zval *pg = &PG(http_globals)[scope_sg_track[i]];
+
+				if (Z_TYPE_P(pg) != IS_ARRAY || Z_ARR_P(pg) != Z_ARR_P(live)) {
+					zval old = *pg;
+					ZVAL_COPY(pg, live);
+					zval_ptr_dtor_nogc(&old);   /* held by the outgoing scope's storage */
+				}
+			}
+			continue;
+		}
+		scope_sg_swap_one(i, from, to);
+	}
+}
+
+/* One entry the general way: a missing or unset superglobal, an entry the symbol table moved,
+ * a CV slot of {main}. */
+static zend_never_inline void scope_sg_swap_one(int i, zval *from, zval *to)
+{
+	{
 		zval *live = scope_symbol(i);   /* a cached bucket, checked by its key: a few compares */
 		bool indirect = live && Z_TYPE_P(live) == IS_INDIRECT;   /* a CV slot of {main} */
 
@@ -416,12 +497,12 @@ static void scope_sg_swap(zval *from, zval *to)
 		if (live && scope_sg_is_empty(live) && Z_TYPE(to[i]) == IS_ARRAY && Z_ARR(to[i]) == &zend_empty_array) {
 			/* empty in both: the live array stays, and stands for the incoming scope's */
 			ZVAL_EMPTY_ARRAY(&from[i]);
-			continue;
+			return;
 		}
 		if (live == NULL) {
 			ZVAL_UNDEF(&from[i]);
 			if (Z_ISUNDEF(to[i])) {
-				continue;   /* unset in both */
+				return;   /* unset in both */
 			}
 			live = scope_symbol(i);
 			if (live) {
@@ -450,11 +531,15 @@ static void scope_sg_swap(zval *from, zval *to)
 		ZVAL_UNDEF(&to[i]);
 		if (scope_sg_track[i] >= 0) {
 			/* C code (ext/session's cookie lookup, browscap, zlib, ...) reads PG(http_globals);
-			 * a scope that has unset the superglobal shows it an empty array */
+			 * a scope that has unset the superglobal shows it an empty array. It only ever holds
+			 * an array: $s = &$_SERVER makes the entry a reference, and $_SERVER = 1 a long. */
 			zval *pg = &PG(http_globals)[scope_sg_track[i]];
 			zval old = *pg;
 
 			if (live) {
+				ZVAL_DEREF(live);
+			}
+			if (live && Z_TYPE_P(live) == IS_ARRAY) {
 				ZVAL_COPY(pg, live);
 			} else {
 				ZVAL_EMPTY_ARRAY(pg);
@@ -545,7 +630,7 @@ static void scope_tl_startup(void)
 /* Swap the live values with a scope's: the timezone is a pointer swap (the holder owns its
  * string, so date_default_timezone_set() inside a scope frees only that scope's); the locale
  * goes through the ini entry, as Locale::setDefault() does, and only when the two differ. */
-static void scope_tl_swap(scope_tl *from, scope_tl *to)
+void scope_tl_swap(scope_tl *from, scope_tl *to)
 {
 	char *tz = SCOPE_DATEG()->timezone;
 
@@ -625,7 +710,13 @@ static scope_sess *scope_sess_new(void)
 	zend_ini_entry *h = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("session.save_handler"));
 	zend_string *hv = h ? h->value : NULL;   /* the request's current setting: ini_set() of it is request-wide */
 
-	ss->mod = hv ? _php_find_ps_module(ZSTR_VAL(hv)) : NULL;
+	/* the live module when it is that handler: an extension may have put its own copy of the
+	 * module in place (ext-phasync's cooperative "files"), and a new scope keeps it */
+	if (hv && scope_ps->mod && strcmp(scope_ps->mod->s_name, ZSTR_VAL(hv)) == 0) {
+		ss->mod = scope_ps->mod;
+	} else {
+		ss->mod = hv ? _php_find_ps_module(ZSTR_VAL(hv)) : NULL;
+	}
 	ss->status = ss->mod ? php_session_none : php_session_disabled;
 	ss->define_sid = true;
 	ZVAL_UNDEF(&ss->http_vars);
@@ -686,7 +777,7 @@ static zend_always_inline bool scope_sess_live_pristine(void)
 	return true;
 }
 
-static void scope_sess_swap(scope_sess *from, scope_sess *to)
+void scope_sess_swap(scope_sess *from, scope_sess *to)
 {
 	zval *sym, in = to->sym;
 	bool indirect, live_pristine = scope_sess_live_pristine();
@@ -879,7 +970,7 @@ static void scope_apply(void)
 		want = Z_OBJ_P(current);
 	}
 	SCOPE_G(cur_scope) = want;
-	if (want == SCOPE_G(applied)) {
+	if (want == SCOPE_G(applied) || (want != NULL && want == SCOPE_G(skip))) {
 		return;
 	}
 	if (SCOPE_G(superglobals)) {
@@ -966,6 +1057,12 @@ static void scope_fiber_init(zend_fiber_context *ctx)
 		a = Z_ARR(arr);
 	}
 	zend_hash_index_update_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(ctx), a);
+	if (ctx == SCOPE_G(out_ctx)) {
+		SCOPE_G(out_ctx) = NULL;
+	}
+	if (ctx == SCOPE_G(in_ctx)) {
+		SCOPE_G(in_ctx) = NULL;
+	}
 }
 
 static void scope_fiber_switch(zend_fiber_context *from, zend_fiber_context *to)
@@ -975,7 +1072,9 @@ static void scope_fiber_switch(zend_fiber_context *from, zend_fiber_context *to)
 	if (!SCOPE_G(active)) {
 		return;
 	}
-	zend_hash_index_update_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(from), SCOPE_G(cur));
+	if (from != SCOPE_G(in_ctx) || SCOPE_G(cur) != SCOPE_G(in_cur)) {
+		zend_hash_index_update_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(from), SCOPE_G(cur));   /* it changed scope */
+	}
 	if (SCOPE_G(resumer)) {
 		zend_hash_index_update_ptr(&SCOPE_G(ctx_resumer), SCOPE_KEY(from), SCOPE_G(resumer));
 	} else if (zend_hash_num_elements(&SCOPE_G(ctx_resumer))) {
@@ -983,8 +1082,16 @@ static void scope_fiber_switch(zend_fiber_context *from, zend_fiber_context *to)
 	}
 	SCOPE_G(resumer) = zend_hash_num_elements(&SCOPE_G(ctx_resumer))
 		? zend_hash_index_find_ptr(&SCOPE_G(ctx_resumer), SCOPE_KEY(to)) : NULL;
-	a = zend_hash_index_find_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(to));
-	SCOPE_G(cur) = a ? a : Z_ARR(SCOPE_G(main));
+	if (to == SCOPE_G(out_ctx)) {
+		a = SCOPE_G(out_cur);
+	} else {
+		a = zend_hash_index_find_ptr(&SCOPE_G(ctx_cur), SCOPE_KEY(to));
+		a = a ? a : Z_ARR(SCOPE_G(main));
+	}
+	SCOPE_G(out_ctx) = from;
+	SCOPE_G(out_cur) = SCOPE_G(cur);
+	SCOPE_G(in_ctx) = to;
+	SCOPE_G(in_cur) = SCOPE_G(cur) = a;
 	scope_apply();
 }
 
@@ -994,6 +1101,12 @@ static void scope_fiber_destroy(zend_fiber_context *ctx)
 		return;
 	}
 	zend_hash_index_del(&SCOPE_G(ctx_cur), SCOPE_KEY(ctx));
+	if (ctx == SCOPE_G(in_ctx)) {
+		SCOPE_G(in_ctx) = NULL;   /* its address can be another context's next */
+	}
+	if (ctx == SCOPE_G(out_ctx)) {
+		SCOPE_G(out_ctx) = NULL;
+	}
 	zend_hash_index_del(&SCOPE_G(ctx_owned), SCOPE_KEY(ctx));
 	zend_hash_index_del(&SCOPE_G(ctx_resumer), SCOPE_KEY(ctx));
 }
@@ -1581,9 +1694,24 @@ static zend_object *scope_create(zend_class_entry *ce)
  * late for that, e.g. inside gc_collect_cycles(). The engine calls this when the last reference
  * goes, from the GC before it frees a cycle, and for every live object at request shutdown
  * before RSHUTDOWN. An exception from the handler propagates as one from a destructor would. */
+/* The state of a scope that is live while another scope is current (under __run_without()) goes
+ * back to that scope's storage, and the current scope's state is applied. */
+static void scope_unapply(zend_object *obj)
+{
+	if (SCOPE_G(applied) == obj && SCOPE_G(cur) != NULL) {
+		zend_object *skip = SCOPE_G(skip);
+
+		SCOPE_G(skip) = NULL;
+		scope_apply();
+		SCOPE_G(skip) = skip;
+	}
+}
+
 static void scope_dtor(zend_object *obj)
 {
 	scope_object *so = SCOPE_OBJECT(obj);
+
+	scope_unapply(obj);
 	if (so->sess && SCOPE_G(active) && SCOPE_G(applied) != obj) {
 		scope_sess *ss = so->sess;
 		so->sess = NULL;
@@ -1623,6 +1751,8 @@ static HashTable *scope_get_gc(zend_object *obj, zval **table, int *n)
 static void scope_free(zend_object *obj)
 {
 	scope_object *so = SCOPE_OBJECT(obj);
+
+	scope_unapply(obj);   /* freed without its destructor having run, as by the cycle collector */
 	if (SCOPE_G(root) == obj) {
 		SCOPE_G(root) = NULL;   /* freed by the object store after RSHUTDOWN */
 	}
@@ -1897,6 +2027,56 @@ ZEND_METHOD(Scope, getCurrent)
 	scope_return(SCOPE_G(cur) ? scope_current(SCOPE_G(cur)) : NULL, return_value);
 }
 
+/* Not part of the RFC: an event loop's way to keep its own scope out of the state switching.
+ * The loop runs in a scope of its own and calls this with its tick loop. While $callback runs,
+ * switching to that scope does not apply its superglobals, session, locale and timezone: the
+ * state of the scope that ran before it stays live, so loop -> fiber in A -> loop -> fiber in A
+ * switches no state, and loop -> A -> loop -> B switches once. Scope::getCurrent() still returns
+ * the loop's scope. Code running in it must not use that state: it sees, and writes to, another
+ * scope's. When $callback returns or throws, the loop's state is applied again. */
+ZEND_METHOD(Scope, __run_without)
+{
+	zend_fcall_info fci;
+	zend_fcall_info_cache fcc;
+	zend_object *scope;
+	bool bailout = false;
+
+	ZEND_PARSE_PARAMETERS_START(1, -1)
+		Z_PARAM_FUNC(fci, fcc)
+		Z_PARAM_VARIADIC_WITH_NAMED(fci.params, fci.param_count, fci.named_params)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (SCOPE_G(cur) == NULL) {
+		zend_throw_error(NULL, "Scope::__run_without() is not available during shutdown");
+		RETURN_THROWS();
+	}
+	scope = Z_TYPE_P(scope_current(SCOPE_G(cur))) == IS_OBJECT ? Z_OBJ_P(scope_current(SCOPE_G(cur))) : NULL;
+	if (scope == NULL || scope == SCOPE_G(root)) {
+		zend_throw_error(NULL, "Scope::__run_without() can't be called from the root scope");
+		RETURN_THROWS();
+	}
+	if (SCOPE_G(skip) != NULL) {
+		zend_throw_error(NULL, "Scope::__run_without() is already running");
+		RETURN_THROWS();
+	}
+
+	GC_ADDREF(scope);
+	SCOPE_G(skip) = scope;
+	fci.retval = return_value;
+	zend_try {
+		zend_call_function(&fci, &fcc);
+	} zend_catch {
+		bailout = true;
+	} zend_end_try();
+	SCOPE_G(skip) = NULL;
+	scope_apply();   /* the current scope's state, the loop's own again */
+	OBJ_RELEASE(scope);
+
+	if (bailout) {
+		zend_bailout();
+	}
+}
+
 ZEND_METHOD(Scope, getRootScope)
 {
 	ZEND_PARSE_PARAMETERS_NONE();
@@ -2110,7 +2290,11 @@ static PHP_RINIT_FUNCTION(scope)
 	ZVAL_UNDEF(&SCOPE_G(members));   /* created with the first Scope */
 	memset(SCOPE_G(sym_cache), 0, sizeof(SCOPE_G(sym_cache)));
 	memset(SCOPE_G(sym_cache_key), 0, sizeof(SCOPE_G(sym_cache_key)));
+	SCOPE_G(sym_ar) = NULL;
+	SCOPE_G(sym_known) = 0;
 	zend_hash_init(&SCOPE_G(ctx_cur), 16, NULL, NULL, 0);
+	SCOPE_G(in_ctx) = SCOPE_G(out_ctx) = NULL;
+	SCOPE_G(skip) = NULL;
 	zend_hash_init(&SCOPE_G(ctx_owned), 8, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&SCOPE_G(ctx_resumer), 8, NULL, NULL, 0);
 	SCOPE_G(resumer) = NULL;
@@ -2139,6 +2323,7 @@ static PHP_RSHUTDOWN_FUNCTION(scope)
 	/* Fibers and generators can outlive this point (objects are freed later in
 	 * shutdown); from here on they simply have no scope. */
 	SCOPE_G(cur) = Z_ARR(SCOPE_G(main));   /* {main}, outside any scope: the globals' own state */
+	SCOPE_G(skip) = NULL;
 	zval_ptr_dtor(scope_current(SCOPE_G(cur)));
 	ZVAL_NULL(scope_current(SCOPE_G(cur)));
 	scope_apply();
