@@ -830,6 +830,15 @@ void scope_sess_swap(scope_sess *from, scope_sess *to)
  * copy of the save handler whose read checks for that first, and throws instead of blocking. A
  * lock held by another process or thread is not affected, and handlers that do not lock behave
  * as under php-fpm. */
+/* An ini entry's current value; NULL when no loaded extension declares it. (zend_ini_str_ex() is
+ * PHP 8.3 and later.) */
+static zend_string *scope_ini_value(const char *name, size_t len)
+{
+	zend_ini_entry *e = zend_hash_str_find_ptr(EG(ini_directives), name, len);
+
+	return e ? e->value : NULL;
+}
+
 static bool scope_sess_mod_locks(const ps_module *mod)
 {
 	zend_string *v;
@@ -841,11 +850,11 @@ static bool scope_sess_mod_locks(const ps_module *mod)
 		return true;
 	}
 	if (strcmp(mod->s_name, "redis") == 0 || strcmp(mod->s_name, "rediscluster") == 0) {
-		v = zend_ini_str_ex(ZEND_STRL("redis.session.locking_enabled"), false, NULL);
+		v = scope_ini_value(ZEND_STRL("redis.session.locking_enabled"));
 		return v && zend_ini_parse_bool(v);
 	}
 	if (strcmp(mod->s_name, "memcached") == 0) {
-		v = zend_ini_str_ex(ZEND_STRL("memcached.sess_locking"), false, NULL);
+		v = scope_ini_value(ZEND_STRL("memcached.sess_locking"));
 		return v && zend_ini_parse_bool(v);
 	}
 	return false;

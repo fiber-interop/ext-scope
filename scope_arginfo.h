@@ -1,5 +1,7 @@
+/* Hand-edited (getRootScope, bind and __run_without added, getCurrent non-nullable): gen_stub.php was not available.
+ * The stub hash below is stale; regenerate from scope.stub.php with gen_stub.php. */
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: d7a120077ba81287788e08d384f26b318d78e332 */
+ * Stub hash: f432f6fe82e64a3852a02737b718f36d89f983d9 */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_class_Scope___construct, 0, 0, 0)
 ZEND_END_ARG_INFO()
@@ -42,7 +44,12 @@ static zend_class_entry *register_class_Scope(void)
 	zend_class_entry ce, *class_entry;
 
 	INIT_CLASS_ENTRY(ce, "Scope", class_Scope_methods);
+#if (PHP_VERSION_ID >= 80400)
 	class_entry = zend_register_internal_class_with_flags(&ce, NULL, ZEND_ACC_FINAL|ZEND_ACC_NO_DYNAMIC_PROPERTIES|ZEND_ACC_NOT_SERIALIZABLE);
+#else
+	class_entry = zend_register_internal_class_ex(&ce, NULL);
+	class_entry->ce_flags |= ZEND_ACC_FINAL|ZEND_ACC_NO_DYNAMIC_PROPERTIES|ZEND_ACC_NOT_SERIALIZABLE;
+#endif
 
 	return class_entry;
 }
