@@ -1,23 +1,45 @@
 --TEST--
-A fiber belongs to the scope current at its construction, keeps it wherever it is resumed from, and keeps run() scopes across suspension
+A fiber's first frame gets the scope current at start(), not at construction; it keeps its scope (and a run() active in it) wherever it is resumed from; bind() gives a fiber a fixed scope; there is no Fiber::getScope()
 --EXTENSIONS--
 scope
 --FILE--
 <?php
 require __DIR__ . '/names.inc';
-$a = named('A'); $b = named('B');
+$a = named('A'); $b = named('B'); $c = named('C');
 
-// Constructed in A, started from B and resumed from {main}: always A inside.
-$f = $a->run(fn() => new Fiber(function () {
-    $before = current_name();
+// Constructed in A, started inside B's run(): B.
+$f = $a->run(fn() => new Fiber(fn() => print("constructed in A, started in B: " . current_name() . "\n")));
+$b->run(fn() => $f->start());
+
+// Constructed in A or in {main}, started from {main}: root.
+$f = $a->run(fn() => new Fiber(fn() => print("constructed in A, started from root: " . current_name() . "\n")));
+$f->start();
+$f = new Fiber(fn() => print("constructed in root, started from root: " . current_name() . "\n"));
+$f->start();
+
+// A bound closure runs in its scope whoever starts the fiber.
+$f = new Fiber($a->bind(fn() => print("bound to A, started from root: " . current_name() . "\n")));
+$f->start();
+$f = new Fiber($a->bind(function () {
+    echo "bound to A, started in B: ", current_name(), "\n";
     Fiber::suspend();
-    echo "fiber: $before, after suspend ", current_name(), "\n";
+    echo "bound to A, resumed from root: ", current_name(), "\n";
 }));
 $b->run(fn() => $f->start());
-echo "main after start: ", current_name(), "\n";
 $f->resume();
-echo "Fiber::getScope(): ", name($f->getScope()), "\n";
-echo "fiber from {main}: ", name((new Fiber(fn() => null))->getScope()), "\n";
+
+// Started in A, resumed from B and from {main}: always A inside.
+$f = new Fiber(function () {
+    $before = current_name();
+    Fiber::suspend();
+    $middle = current_name();
+    Fiber::suspend();
+    echo "started in A: $before, resumed from B $middle, resumed from root ", current_name(), "\n";
+});
+$a->run(fn() => $f->start());
+echo "main after start: ", current_name(), "\n";
+$b->run(fn() => $f->resume());
+$f->resume();
 
 // Suspending inside run() doesn't leave run(): the resumer keeps its own scope.
 $f = new Fiber(function () use ($a) {
@@ -32,31 +54,49 @@ $f->start();
 echo "main while fiber is inside run: ", current_name(), "\n";
 $f->resume();
 
-// Constructed in A, suspended inside B's run().
-$f = $a->run(fn() => new Fiber(function () use ($b) {
-    $b->run(function () { Fiber::suspend(); echo "in B's run: ", current_name(), "\n"; });
-    echo "back in own scope: ", current_name(), "\n";
-}));
-$f->start();
-$f->resume();
+// Started in A, suspended inside C's run(), resumed from B: C, then A once that run() returns.
+$f = new Fiber(function () use ($c) {
+    $c->run(function () { Fiber::suspend(); echo "in C's run, resumed from B: ", current_name(), "\n"; });
+    echo "after C's run: ", current_name(), "\n";
+    Fiber::suspend();
+    echo "resumed from B again: ", current_name(), "\n";
+});
+$a->run(fn() => $f->start());
+$b->run(fn() => $f->resume());
+echo "B after resume: ", $b->run(fn() => current_name()), ", main: ", current_name(), "\n";
+$b->run(fn() => $f->resume());
 
-// Fibers constructed inside a fiber join its scope.
-$f = $a->run(fn() => new Fiber(function () {
-    $child = new Fiber(fn() => print("child: " . current_name() . "\n"));
-    echo "child belongs to: ", name($child->getScope()), "\n";
+// A fiber started inside a fiber gets that fiber's scope at that point.
+$f = new Fiber(function () use ($b) {
+    $child = new Fiber(fn() => print("child started in the fiber: " . current_name() . "\n"));
+    $other = new Fiber(fn() => print("child started in B's run inside the fiber: " . current_name() . "\n"));
     $child->start();
-}));
-$f->start();
+    $b->run(fn() => $other->start());
+});
+$a->run(fn() => $f->start());
+
+// A fiber that is never started runs nothing and records nothing.
+$a->run(fn() => new Fiber(fn() => null));
+
+var_dump(method_exists('Fiber', 'getScope'), method_exists('Generator', 'getScope'));
 ?>
 --EXPECT--
+constructed in A, started in B: B
+constructed in A, started from root: root
+constructed in root, started from root: root
+bound to A, started from root: A
+bound to A, started in B: A
+bound to A, resumed from root: A
 main after start: root
-fiber: A, after suspend A
-Fiber::getScope(): A
-fiber from {main}: root
+started in A: A, resumed from B A, resumed from root A
 main while fiber is inside run: root
 inside run: A, after suspend A
 fiber after run: root
-in B's run: B
-back in own scope: A
-child belongs to: A
-child: A
+in C's run, resumed from B: C
+after C's run: A
+B after resume: B, main: root
+resumed from B again: A
+child started in the fiber: A
+child started in B's run inside the fiber: B
+bool(false)
+bool(true)

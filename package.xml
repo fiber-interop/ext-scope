@@ -3,24 +3,24 @@
  <name>scope</name>
  <channel>pecl.php.net</channel>
  <summary>Scope: the identity of the operation (request, job) that code belongs to</summary>
- <description>The Scope class proposed in the PHP RFC "Scope", for PHP 8.2 and later. Fibers and generators belong to the scope current at their creation; Scope::getRootScope() is the scope outside any Scope::run().</description>
+ <description>The Scope class proposed in the PHP RFC "Scope", for PHP 8.2 and later. Generators belong to the scope current at their creation, fibers to the scope current where they are started; Scope::getRootScope() is the scope outside any Scope::run().</description>
  <lead>
   <name>Frode Børli</name>
   <user>frodeborli</user>
   <email>frode@ennerd.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-28</date>
+ <date>2026-10-29</date>
  <version>
-  <release>0.5.0</release>
-  <api>0.5.0</api>
+  <release>0.6.0</release>
+  <api>0.6.0</api>
  </version>
  <stability>
   <release>alpha</release>
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.5.0: Scope::__run_without(), not part of the RFC, lets an event loop running in a scope of its own keep that scope out of the state switching. Scope switches are cheaper (the superglobals are moved without being compared, and the per-fiber bookkeeping and a missing $_SESSION cost no lookups). Fixes: a crash in C code reading the request arrays after a scope made a superglobal a reference or a non-array; a new scope dropping a save handler module another extension had put in place of ext/session's; a superglobal deleted from the end of the symbol table being confused with the variable added after it.</notes>
+ <notes>0.6.0: the fiber rule of the Scope RFC 0.10. Fiber::start() is an ordinary call: a fiber runs in the scope current where start() is called, and constructing a fiber captures nothing. A started fiber keeps its scope across suspensions, whoever resumes it; new Fiber($scope->bind($fn)) runs in $scope whoever starts it. A finished fiber no longer keeps its scope alive. Fiber::getScope() is removed; Generator::getScope() and generators are unchanged.</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
@@ -86,6 +86,7 @@
     <file name="session_lock_conflict.phpt" role="test"/>
     <file name="session_pristine_skip.phpt" role="test"/>
     <file name="superglobals_empty_skip.phpt" role="test"/>
+    <file name="superglobals_fiber_start.phpt" role="test"/>
     <file name="zts_parallel_boundaries.phpt" role="test"/>
     <file name="zts_parallel_isolation.phpt" role="test"/>
     <file name="run_without.phpt" role="test"/>

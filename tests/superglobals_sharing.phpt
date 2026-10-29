@@ -8,15 +8,15 @@ $_GET = ["n" => 0];
 $a = new Scope(); $b = new Scope();
 $a->run(function () { $_GET = ["n" => 0]; });
 $gen = $a->run(function () { return (function () { $_GET["n"]++; yield $_GET["n"]; $_GET["n"]++; yield $_GET["n"]; })(); });
-$f = $a->run(fn() => new Fiber(function () { $_GET["n"] += 10; Fiber::suspend(); echo "A fiber sees ", $_GET["n"], "\n"; }));
-$fb = $b->run(fn() => new Fiber(function () { $_GET["n"] = "B"; Fiber::suspend(); echo "B fiber sees ", $_GET["n"], "\n"; }));
-$f->start(); $fb->start();
+$f = new Fiber(function () { $_GET["n"] += 10; Fiber::suspend(); echo "A fiber sees ", $_GET["n"], "\n"; });
+$fb = new Fiber(function () { $_GET["n"] = "B"; Fiber::suspend(); echo "B fiber sees ", $_GET["n"], "\n"; });
+$a->run(fn() => $f->start()); $b->run(fn() => $fb->start());
 echo "main ", $_GET["n"], "\n";
 echo $gen->current(), "\n";   // runs in A
 echo "main ", $_GET["n"], "\n";
 $f->resume(); $fb->resume();
 $gen->next(); echo $gen->current(), "\n";
-$f2 = $a->run(fn() => new Fiber(fn() => print("A new fiber sees " . $_GET["n"] . "\n"))); $f2->start();
+$f2 = new Fiber(fn() => print("A new fiber sees " . $_GET["n"] . "\n")); $a->run(fn() => $f2->start());
 --EXPECT--
 main 0
 11

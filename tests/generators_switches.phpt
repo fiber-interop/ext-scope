@@ -39,9 +39,9 @@ echo implode(', ', iterator_to_array($gen, false)), "; return ", $gen->getReturn
 // Generators of different scopes resumed from fibers that interleave.
 $g1 = $b->run(fn() => (function () { while (true) { $x = yield current_name(); Fiber::suspend(); } })());
 $g2 = $c->run(fn() => (function () { while (true) { $x = yield current_name(); Fiber::suspend(); } })());
-$f1 = $a->run(fn() => new Fiber(function () use ($g1) { $g1->current(); $g1->send(1); echo "f1 after g1: ", current_name(), "\n"; }));
+$f1 = new Fiber(function () use ($g1) { $g1->current(); $g1->send(1); echo "f1 after g1: ", current_name(), "\n"; });
 $f2 = new Fiber(function () use ($g2) { $g2->current(); $g2->send(1); echo "f2 after g2: ", current_name(), "\n"; });
-$f1->start(); $f2->start(); $f1->resume(); $f2->resume();
+$a->run(fn() => $f1->start()); $f2->start(); $f1->resume(); $f2->resume();
 echo "main: ", current_name(), "\n";
 
 // A generator compiled by eval().

@@ -18,7 +18,6 @@ final class Scope
     public static function getRootScope(): Scope {}
 }
 
-Fiber::getScope(): Scope;       // added by the extension
 Generator::getScope(): Scope;   // added by the extension
 ```
 
@@ -27,18 +26,32 @@ $scope = new Scope();
 $scope->run(function () {
     Scope::getCurrent();          // $scope
     $fiber = new Fiber(function () {
-        Scope::getCurrent();      // $scope: fibers join the scope they are constructed in
+        Scope::getCurrent();      // $scope: a fiber runs in the scope it is started in
     });
     $fiber->start();
 });
 Scope::getCurrent();              // Scope::getRootScope()
+
+$fiber = new Fiber($scope->bind($work));   // runs in $scope, whoever starts it
 ```
 
 The root scope is one object for the whole request (process, on the CLI). It is current in
-`{main}` outside any `run()`, and in fibers and generators created there, so `getCurrent()` and
-`getScope()` never return `null`. "Am I inside an operation" is
+`{main}` outside any `run()`, in fibers started there and in generators created there, so
+`getCurrent()` and `Generator::getScope()` never return `null`. "Am I inside an operation" is
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
+
+## Release 0.6.0
+
+0.6.0 implements the fiber rule of the Scope RFC 0.10: every stack frame gets its scope when it is created, and
+`$fiber->start()` is an ordinary call, so a fiber's first frame gets the scope current where `start()` is called.
+Constructing a fiber creates no frame and captures nothing. Once started, a fiber keeps its scope (and any `run()`
+active in it) while it is suspended, whoever resumes it, as before. `new Fiber($scope->bind($fn))` gives a fiber a
+fixed scope, whoever starts it. A fiber that has finished no longer keeps the scope it ran in alive.
+
+`Fiber::getScope()` is removed; `Generator::getScope()` stays, and generators are unchanged. Code that constructs a
+fiber inside `$scope->run()` and starts it outside, expecting it to run in `$scope`, must bind its closure or start it
+inside `run()`.
 
 ## Release 0.5.0
 
@@ -126,9 +139,10 @@ A project that declares its own global `Scope` class cannot install this package
 
 - `$scope->run($callback)` makes `$scope` current while `$callback` runs, and restores the
   previous scope afterwards, also on exceptions and fatal errors.
-- A fiber belongs to the scope current when it is constructed; a generator to the scope current
-  when the generator function is called. Wherever either is resumed from, it runs in its own
-  scope.
+- A fiber runs in the scope current when `start()` is called (constructing it captures nothing);
+  `new Fiber($scope->bind($fn))` runs in `$scope` whoever starts it. A generator belongs to the
+  scope current when the generator function is called. Wherever either is resumed from, it keeps
+  its scope.
 - Functions and closures run in their caller's scope.
 - The scope never changes within an executing function, except through `run()` calls it makes:
   across a `yield` or a `Fiber::suspend()`, `Scope::getCurrent()` returns what it returned before.
@@ -231,7 +245,8 @@ with `0`, all scopes share one timezone and one locale.
 
 `$scope->bind($closure)` returns a new closure that runs `$closure` with `$scope` current, exactly as `run()` would,
 whoever calls it and from whichever scope: the previous scope is restored when it returns or throws, and calls nest.
-Generators and fibers created inside such a call belong to `$scope`. `$closure` itself is unchanged and still runs in
+Generators created and fibers started inside such a call belong to `$scope`, so `new Fiber($scope->bind($fn))` is a
+fiber that runs in `$scope` whoever starts it. `$closure` itself is unchanged and still runs in
 its caller's scope. Binding a closure that `bind()` returned replaces its scope rather than nesting:
 `$a->bind($b->bind($fn))` runs `$fn` in `$a`.
 
@@ -313,7 +328,7 @@ php -d extension=modules/scope.so your-script.php
 ## Cost
 
 An extension can't add fields to the engine's fiber and generator objects, so this one keeps each
-fiber's and generator's scope in a `WeakMap`. It follows fiber switches with the engine's fiber
+started fiber's and each generator's scope in a `WeakMap`. It follows fiber switches with the engine's fiber
 observer. For generators it compiles scope switches into generator bodies only (a `zend_extension`
 op_array handler, registered by the extension itself): the body switches to the generator's scope
 when it starts, after each `yield` and at each `catch` and `finally`, and back to the resumer's scope

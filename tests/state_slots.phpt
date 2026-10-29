@@ -14,7 +14,7 @@ echo "A: ", $a->run(fn() => scope_demo_counter() . scope_demo_counter()), "\n";
 echo "B: ", $b->run(fn() => scope_demo_counter()), "\n";
 echo "root again: ", scope_demo_counter(), "\n";
 
-$f = $a->run(fn() => new Fiber(function () { echo "A's fiber: ", scope_demo_counter(), "\n"; Fiber::suspend(); echo "A's fiber resumed: ", scope_demo_counter(), "\n"; }));
+$f = new Fiber($a->bind(function () { echo "A's fiber: ", scope_demo_counter(), "\n"; Fiber::suspend(); echo "A's fiber resumed: ", scope_demo_counter(), "\n"; }));
 $g = $a->run(fn() => (function () { yield scope_demo_counter(); })());
 $b->run(fn() => $f->start());
 echo "A's generator, consumed in B: ", $b->run(fn() => $g->current()), "\n";

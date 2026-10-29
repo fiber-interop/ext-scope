@@ -15,7 +15,7 @@ json_decode('{bad');
 echo "main: ", $err(), "\n";
 
 $a = new Scope(); $b = new Scope();
-$fa = $a->run(fn() => new Fiber(function () use ($err) {
+$fa = new Fiber($a->bind(function () use ($err) {
     echo "A starts fresh: ", $err(), "\n";
     json_decode('[1,');
     Fiber::suspend();
@@ -23,7 +23,7 @@ $fa = $a->run(fn() => new Fiber(function () use ($err) {
     $child = new Fiber(fn() => print("A's child fiber shares it: " . $err() . "\n"));
     $child->start();
 }));
-$fb = $b->run(fn() => new Fiber(function () use ($err) {
+$fb = new Fiber($b->bind(function () use ($err) {
     echo "B starts fresh: ", $err(), "\n";
     json_decode("\"\xff\"");
     echo "B: ", $err(), "\n";

@@ -5,7 +5,8 @@
  *
  * Every execution context has a small PHP array describing it:
  *
- *   [0] the scope it belongs to (fibers and generators; null for {main})
+ *   [0] the scope it belongs to: a generator's is current when the generator function is
+ *       called, a fiber's when it is started; null for {main}
  *   [1] its current scope
  *   [2...] the scopes saved by the Scope::run() calls active in it, innermost last
  *
@@ -46,7 +47,7 @@
 ZEND_TSRMLS_CACHE_EXTERN()
 #endif
 
-#define PHP_SCOPE_VERSION "0.5.0"
+#define PHP_SCOPE_VERSION "0.6.0"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -228,7 +229,6 @@ ZEND_DECLARE_MODULE_GLOBALS(scope)
 static zend_class_entry *scope_ce;
 static zend_class_entry *scope_weakmap_ce;   /* WeakMap's entry isn't exported */
 static zend_object_handlers scope_handlers;
-static zend_object *(*scope_fiber_create_orig)(zend_class_entry *ce);
 static zend_object *(*scope_generator_create_orig)(zend_class_entry *ce);
 static zend_object_handlers scope_generator_handlers;   /* the engine's, with dtor_obj wrapped */
 static const zend_object_handlers *scope_generator_handlers_orig;
@@ -256,11 +256,11 @@ static zend_always_inline zval *scope_current(zend_array *a)
 	return zend_hash_index_find(a, SCOPE_CURRENT);
 }
 
-/* The array of a Fiber or Generator object, or NULL while no Scope exists (all of them
- * are the root's then). The WeakMap is created with the first Scope, so a request that
- * never uses one allocates no object of the extension's and sees the same object ids as
- * without it. A fiber or generator without an entry was created before that: it is the
- * root's, and gets its array now. */
+/* The array of a Generator object, or NULL while no Scope exists (all of them are the
+ * root's then). The WeakMap is created with the first Scope, so a request that never uses
+ * one allocates no object of the extension's and sees the same object ids as without it.
+ * A generator without an entry was created before that: it is the root's, and gets its
+ * array now. */
 static zend_array *scope_member_array(zend_object *obj)
 {
 	zval key, rv, *v, null, arr;
@@ -280,25 +280,20 @@ static zend_array *scope_member_array(zend_object *obj)
 	return Z_ARR(arr);
 }
 
-/* A Fiber or Generator belongs to the scope that is current when it is created. */
-static void scope_register_member(zend_object *obj)
+/* A Generator belongs to the scope that is current when it is created, a Fiber to the one
+ * current when it is started. Returns the new array, or NULL while no Scope exists. */
+static zend_array *scope_register_member(zend_object *obj)
 {
 	zval key, arr;
 
 	if (!SCOPE_G(active) || SCOPE_G(cur) == NULL || Z_ISUNDEF(SCOPE_G(members))) {
-		return;   /* no Scope yet: a member of the root, recorded when first looked up */
+		return NULL;   /* no Scope yet: a member of the root, recorded when first looked up */
 	}
 	ZVAL_ARR(&arr, scope_array_new(scope_current(SCOPE_G(cur))));
 	ZVAL_OBJ(&key, obj);
 	Z_OBJ_HT(SCOPE_G(members))->write_dimension(Z_OBJ(SCOPE_G(members)), &key, &arr);
 	zval_ptr_dtor(&arr);   /* the WeakMap holds it now */
-}
-
-static zend_object *scope_fiber_create(zend_class_entry *ce)
-{
-	zend_object *obj = scope_fiber_create_orig(ce);
-	scope_register_member(obj);
-	return obj;
+	return Z_ARR(arr);
 }
 
 static zend_object *scope_generator_create(zend_class_entry *ce)
@@ -1055,11 +1050,14 @@ static void scope_fiber_init(zend_fiber_context *ctx)
 	if (!SCOPE_G(active)) {
 		return;
 	}
+	/* Fiber::start() is an ordinary call: the fiber's first frame gets the scope of the code
+	 * starting it. A Fiber's array is kept in the WeakMap, where the cycle collector sees the
+	 * scopes saved in it while it is suspended inside run(). */
 	if (ctx->kind == zend_ce_fiber) {
-		a = scope_member_array(&((zend_fiber *) ((char *) ctx - XtOffsetOf(zend_fiber, context)))->std);
+		a = scope_register_member(&((zend_fiber *) ((char *) ctx - XtOffsetOf(zend_fiber, context)))->std);
 	}
 	if (a == NULL) {
-		/* Another kind of fiber context: it belongs to the scope that starts it. */
+		/* Another kind of fiber context, or no Scope exists yet: likewise the starter's scope. */
 		zval arr;
 		ZVAL_ARR(&arr, scope_array_new(scope_current(SCOPE_G(cur))));
 		zend_hash_index_update(&SCOPE_G(ctx_owned), SCOPE_KEY(ctx), &arr);
@@ -1118,6 +1116,12 @@ static void scope_fiber_destroy(zend_fiber_context *ctx)
 	}
 	zend_hash_index_del(&SCOPE_G(ctx_owned), SCOPE_KEY(ctx));
 	zend_hash_index_del(&SCOPE_G(ctx_resumer), SCOPE_KEY(ctx));
+	if (ctx->kind == zend_ce_fiber && !Z_ISUNDEF(SCOPE_G(members))) {
+		/* A finished fiber has no frames, so it keeps no scope alive. */
+		zval key;
+		ZVAL_OBJ(&key, &((zend_fiber *) ((char *) ctx - XtOffsetOf(zend_fiber, context)))->std);
+		Z_OBJ_HT(SCOPE_G(members))->unset_dimension(Z_OBJ(SCOPE_G(members)), &key);
+	}
 }
 
 /* ---- generators: switches compiled into generator bodies -------------------
@@ -2093,9 +2097,9 @@ ZEND_METHOD(Scope, getRootScope)
 	RETURN_OBJ_COPY(scope_root());
 }
 
-/* ---- Fiber::getScope() and Generator::getScope() --------------------------- */
+/* ---- Generator::getScope() ------------------------------------------------- */
 
-static void scope_get_member_scope(INTERNAL_FUNCTION_PARAMETERS)
+static ZEND_NAMED_FUNCTION(scope_generator_get_scope)
 {
 	zend_array *a;
 
@@ -2103,16 +2107,6 @@ static void scope_get_member_scope(INTERNAL_FUNCTION_PARAMETERS)
 
 	a = scope_member_array(Z_OBJ_P(ZEND_THIS));
 	scope_return(a ? zend_hash_index_find(a, SCOPE_MEMBER) : NULL, return_value);
-}
-
-static ZEND_NAMED_FUNCTION(scope_fiber_get_scope)
-{
-	scope_get_member_scope(INTERNAL_FUNCTION_PARAM_PASSTHRU);
-}
-
-static ZEND_NAMED_FUNCTION(scope_generator_get_scope)
-{
-	scope_get_member_scope(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_scope_get_scope, 0, 0, Scope, 0)
@@ -2123,11 +2117,6 @@ ZEND_END_ARG_INFO()
 #else
 # define SCOPE_FENTRY(name, handler) ZEND_RAW_FENTRY(name, handler, arginfo_scope_get_scope, ZEND_ACC_PUBLIC)
 #endif
-
-static const zend_function_entry scope_fiber_methods[] = {
-	SCOPE_FENTRY("getScope", scope_fiber_get_scope)
-	ZEND_FE_END
-};
 
 static const zend_function_entry scope_generator_methods[] = {
 	SCOPE_FENTRY("getScope", scope_generator_get_scope)
@@ -2248,11 +2237,8 @@ static PHP_MINIT_FUNCTION(scope)
 		return FAILURE;
 	}
 
-	zend_register_functions(zend_ce_fiber, scope_fiber_methods, &zend_ce_fiber->function_table, MODULE_PERSISTENT);
 	zend_register_functions(zend_ce_generator, scope_generator_methods, &zend_ce_generator->function_table, MODULE_PERSISTENT);
 
-	scope_fiber_create_orig = zend_ce_fiber->create_object;
-	zend_ce_fiber->create_object = scope_fiber_create;
 	scope_generator_create_orig = zend_ce_generator->create_object;
 	zend_ce_generator->create_object = scope_generator_create;
 	scope_generator_get_iterator_orig = zend_ce_generator->get_iterator;
@@ -2275,7 +2261,6 @@ static PHP_MINIT_FUNCTION(scope)
 
 static PHP_MSHUTDOWN_FUNCTION(scope)
 {
-	zend_ce_fiber->create_object = scope_fiber_create_orig;
 	zend_ce_generator->create_object = scope_generator_create_orig;
 	zend_ce_generator->get_iterator = scope_generator_get_iterator_orig;
 	scope_generator_methods_swap(false);

@@ -6,18 +6,18 @@ scope
 <?php
 $_SERVER["V"] = "root"; $_REQUEST["V"] = "root";
 $a = new Scope(); $b = new Scope();
-$fa = $a->run(fn() => new Fiber(function () {
+$fa = new Fiber(function () {
     $_SERVER["V"] = "A"; $_REQUEST["V"] = "A";
     Fiber::suspend();
     echo "A sees ", $_SERVER["V"], " ", $_REQUEST["V"], "\n";
-}));
-$fb = $b->run(fn() => new Fiber(function () {
+});
+$fb = new Fiber(function () {
     $_SERVER["V"] = "B"; $_REQUEST["V"] = "B";
     Fiber::suspend();
     echo "B sees ", $_SERVER["V"], " ", $_REQUEST["V"], "\n";
-}));
-$fa->start();
-$fb->start();
+});
+$a->run(fn() => $fa->start());
+$b->run(fn() => $fb->start());
 echo "root ", $_SERVER["V"], " ", $_REQUEST["V"], "\n";
 $fa->resume();
 $fb->resume();

@@ -10,11 +10,11 @@ $loop = new Scope;
 $loop->run(fn() => $_GET = ['who' => 'loop']);
 $a = new Scope;
 $b = new Scope;
-$fa = $a->run(fn() => new Fiber(function () {
+$fa = new Fiber($a->bind(function () {
     $_GET = ['who' => 'a'];
     while (Fiber::suspend()) echo "  in a: ", $_GET['who'], "\n";
 }));
-$fb = $b->run(fn() => new Fiber(function () {
+$fb = new Fiber($b->bind(function () {
     $_GET = ['who' => 'b'];
     Fiber::suspend();
     echo "  in b: ", $_GET['who'], "\n";
@@ -37,7 +37,7 @@ $loop->run(function () use ($loop, &$fa, $fb) {
     echo "returned $r, loop again: ", $_GET['who'], "\n";
 
     // a scope whose state is live is destroyed: its state goes back, the loop's is applied
-    $fc = (new Scope)->run(fn() => new Fiber(function () { $_GET = ['who' => 'c']; Fiber::suspend(); }));
+    $fc = new Fiber((new Scope)->bind(function () { $_GET = ['who' => 'c']; Fiber::suspend(); }));
     Scope::__run_without(function () use (&$fc) {
         $fc->start();
         echo "loop after c: ", $_GET['who'], "\n";
