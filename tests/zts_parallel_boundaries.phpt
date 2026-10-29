@@ -47,8 +47,8 @@ for ($t = 0; $t < 4; $t++) {
                     $_SESSION["i"] = $i;
                 }
             });
-            $f = $s->run(fn() => new Fiber(fn() => Fiber::suspend()));
-            $f->start();
+            $f = new Fiber(fn() => Fiber::suspend());
+            $s->run(fn() => $f->start());
             $keep[] = [$s, $f];
         }
         return $t;

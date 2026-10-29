@@ -32,19 +32,19 @@ $work = function (int $t): string {
         });
         $scopes[$n] = $s;
     }
-    // fibers and generators of both scopes, stepped alternately from the root
+    // fibers started in and generators created in both scopes, stepped alternately from the root
     $fibers = $gens = [];
     foreach ($scopes as $n => $s) {
-        $fibers[$n] = $s->run(fn() => new Fiber(function () {
+        $fibers[$n] = new Fiber(function () {
             while (true) Fiber::suspend($_GET["who"] . "/" . date_default_timezone_get()
                 . "/" . (extension_loaded("intl") ? Locale::getDefault() : "-")
                 . "/" . ($_SESSION["who"] ?? "-"));
-        }));
+        });
         $gens[$n] = $s->run(fn() => (function () { while (true) yield $_GET["who"]; })());
     }
     $bad = 0;
     $first = [];
-    foreach ($fibers as $n => $f) $first[$n] = $f->start();
+    foreach ($fibers as $n => $f) $first[$n] = $scopes[$n]->run(fn() => $f->start());
     for ($i = 0; $i < 2000; $i++) {
         foreach ($fibers as $n => $f) {
             if ($f->resume() !== $first[$n]) $bad++;
