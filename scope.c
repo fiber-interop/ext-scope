@@ -1974,6 +1974,26 @@ static ZEND_NAMED_FUNCTION(scope_bound_call)
 	}
 }
 
+/* For a host that bundles this file (ext-phasync's sapi(), deciding whether a fiber started
+ * inside a request belongs to it): whether fn is a function Scope::bind() returned whose scope
+ * is not the one current now. Not part of the RFC. */
+bool scope_fn_bound_elsewhere(const zend_function *fn)
+{
+	scope_bound *b;
+	zval *cur;
+	zend_object *now;
+
+	/* As in bind(): a closure's handler is the engine's, so it is known by its slot. */
+	if (!SCOPE_G(active) || scope_bound_handle < 0 || fn->type != ZEND_INTERNAL_FUNCTION
+	 || (b = fn->internal_function.reserved[scope_bound_handle]) == NULL
+	 || zend_hash_index_find_ptr(&SCOPE_G(bound), (zend_ulong) (uintptr_t) b) != b) {
+		return false;   /* not one, or its scope is gone (calling it throws) */
+	}
+	cur = SCOPE_G(cur) ? scope_current(SCOPE_G(cur)) : NULL;
+	now = cur && Z_TYPE_P(cur) == IS_OBJECT ? Z_OBJ_P(cur) : SCOPE_G(root);
+	return b->scope != now;
+}
+
 ZEND_METHOD(Scope, bind)
 {
 	zval *closure, this_zv;
