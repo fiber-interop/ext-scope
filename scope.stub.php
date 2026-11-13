@@ -10,13 +10,14 @@
  *
  * With the ini setting scope.superglobals=1 (the default), $_GET, $_POST, $_COOKIE, $_FILES,
  * $_REQUEST and $_SERVER follow the scope: the root scope's arrays are the SAPI's, a new scope
- * starts with empty arrays (whoever creates it seeds them), and writes inside a scope stay in it.
+ * starts as a copy of its creator's (the scope current when it is constructed), and writes inside a scope stay in it.
  * $_ENV is not in scope. With scope.session=1 (the default) the session follows the scope too:
- * its id, status, save handler state and $_SESSION.
+ * its id, status, save handler state and $_SESSION; a new scope holds a copy of its creator's
+ * session and does not open it again.
  *
  * With scope.locale_timezone=1 (the default) the default timezone (date_default_timezone_get()/
  * set()) and, when intl is loaded, the default locale (Locale::getDefault()/setDefault()) follow
- * the scope the same way: a new scope starts with the ini values, not its creator's, and a change
+ * the scope the same way: a new scope starts with its creator's values, and a change
  * stays in the scope.
  *
  * A fiber runs in the scope current where it is started; new Fiber($scope->bind($fn)) runs in

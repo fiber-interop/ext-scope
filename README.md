@@ -41,6 +41,22 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Unreleased
+
+Implements the copy rule of the Scope RFC 0.10: **a new scope starts as a copy of the scope that is current when the
+`Scope` object is constructed** (at `new Scope()`, not at the first `run()`), instead of empty. There is no option
+to start empty.
+
+- The six request arrays are PHP array copies (a refcount until one side writes), so the two scopes are independent
+  afterwards; `unset($_GET)` in the copy does not touch the creator. Objects in the arrays are the same instances.
+- The session is copied as it is: the same id, status and a copy of `$_SESSION`. The copy does not open the session
+  again. See "Session" below.
+- The timezone and the intl locale are the creator's current values; a creator that never set a timezone passes on
+  "none", so `ini_set('date.timezone')` keeps reaching its copies.
+- Constructed from the root scope under the CLI, a scope has the CLI's arrays and no session.
+- Fixes a hang on PHP 8.2 to 8.4 when a scope unset a superglobal and the root's was switched back in: a switch copied
+  the symbol table's hash chain link along with the value.
+
 ## Release 0.6.0
 
 0.6.0 implements the fiber rule of the Scope RFC 0.10: every stack frame gets its scope when it is created, and
@@ -156,13 +172,15 @@ The RFC has the full motivation, the rules and prior art in other languages.
 `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES`, `$_REQUEST` and `$_SERVER` follow the scope:
 
 - In the root scope they are the SAPI's arrays, so code that never creates a scope sees today's behaviour.
-- A new scope starts with six empty arrays, wherever it is created; whoever creates it seeds them, as a server
-  does for each request. The creator's arrays are not copied.
+- A new scope starts with a copy of its creator's six arrays (the scope that is current when `new Scope()` runs):
+  PHP's array copy, so nothing is duplicated until one side writes, objects in the arrays are the same instances, and
+  from then on the two are independent. A server constructs the request's scope from its loop in the root scope, where
+  the arrays are the CLI's, and fills them in; code that wants fewer than its creator has assigns or unsets them.
 - An assignment or write inside a scope changes only that scope's array. Reads see the current scope's array;
   every fiber and generator of the scope shares it. `$_REQUEST` is an array like the others, not a live merge.
 - `$_SERVER` carries both the request (`REQUEST_URI`, `HTTP_*`, ...) and the environment (`PATH`,
-  `DOCUMENT_ROOT`, ...); both follow the scope the same way, so a new scope's `$_SERVER` starts empty, environment
-  entries included (read what you need from the root's `$_SERVER` before seeding).
+  `DOCUMENT_ROOT`, ...); both follow the scope the same way, so a new scope's `$_SERVER` is a copy of its creator's,
+  environment entries included.
 - `$_ENV` describes the process and is not in scope. `$_SESSION` follows the scope's session (below).
 
 When the current scope changes (`run()` entering or leaving, a fiber switch, a generator resuming or yielding) the
@@ -180,7 +198,7 @@ of the base proposal: with `0`, all scopes share the SAPI's arrays (and the sess
 
 When ext/session is loaded (it is an optional dependency), its request state follows the scope too:
 
-- Swapped at each scope change: `$_SESSION`, the scope's own like the other superglobals (a new scope has none, and
+- Swapped at each scope change: `$_SESSION`, the scope's own like the other superglobals (a new scope holds a copy of its creator's, and
   it keeps its array after `session_write_close()`, `session_abort()` or `session_destroy()`, as in a request), the session id,
   status, the save handler module and its data (`mod`, `mod_data`), user save handlers
   (`session_set_save_handler()`: the handler callables, class name, open/implemented flags), the serialized original
@@ -191,8 +209,16 @@ When ext/session is loaded (it is an optional dependency), its request state fol
   request-wide, as `ini_set()` does. A started session can't have them changed (ext/session refuses while it is
   active), but a scope without an active session can change them for the whole request, so a started session that
   reads them again (`session_regenerate_id()`, the getters) sees the request's current values.
-- A new scope has no session (`PHP_SESSION_NONE`) and the save handler of the current `session.save_handler` setting
-  (not a handler the creator set with `session_set_save_handler()`).
+- A new scope's session is a copy of its creator's: the same id, status, save handler (also one set with
+  `session_set_save_handler()`) and a copy of `$_SESSION`. Constructed from the root scope on the CLI that is no session
+  (`PHP_SESSION_NONE`).
+- A copy of an **active** session does not open it again, so a locking handler's lock is not taken twice and stays
+  with the scope that opened the session. `session_write_close()` in the copy writes the copy's `$_SESSION` under the
+  id (through the opener's handle while the opener still holds the session, otherwise through a handler opened for the
+  write); the opener writes its own when it closes, so the later write wins. Closing the copy never releases the
+  lock or calls a user handler's `close()`. A copy destroyed while still active is dropped: it writes nothing and
+  leaves the opener's session open. `session_regenerate_id()` in such a copy throws a `RuntimeException`, because it
+  would reopen the handler and wait for the opener's lock. A copy is not a second opening for the rule below.
 - `session_start()` inside a scope starts that scope's session; all its fibers and generators share it.
 - A scope destroyed with its session active writes and closes it, as request end does. This happens in the
   destructor phase, so a user save handler's `write()` and `close()` run as a destructor would: when the last
@@ -217,8 +243,8 @@ When ext/session is loaded (it is an optional dependency), its request state fol
 
 `date_default_timezone_get()/set()` (ext/date) and `Locale::getDefault()/setDefault()` (ext/intl, only when intl is
 loaded) follow the scope with the same rules as the superglobals: the root scope's values are today's (from ini and
-the SAPI), a new scope starts with the ini values (`date.timezone`, or its fallback when unset; `intl.default_locale`,
-or ICU's default at request start when unset), not with its creator's, a change
+the SAPI), a new scope starts with its creator's current values (a creator that never set a timezone passes on "none", so the
+copy keeps following `ini_set('date.timezone')`), a change
 inside a scope affects only that scope, and code outside any scope sees no change. Fibers and generators of a scope
 share its values.
 
@@ -236,7 +262,7 @@ How it is done, and what a switch costs:
   the engine's ini restore at request end correct. When two scopes have the same locale a switch is a string
   comparison; when they differ it allocates the new ini string (the one cost above two words).
 - `ini_set('date.timezone')` is a request-wide ini, not scope state. A scope that has set its own timezone is not
-  affected by it; a scope that never set one uses the ini value, which is the same for all of them.
+  affected by it; a scope that never set one, and a copy of such a scope, uses the ini value.
 
 `scope.locale_timezone` (default `1`, `PHP_INI_SYSTEM`) turns this off independently of `scope.superglobals`:
 with `0`, all scopes share one timezone and one locale.

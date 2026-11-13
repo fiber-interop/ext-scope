@@ -1,5 +1,5 @@
 --TEST--
-Superglobals: with auto_globals_jit=0, a file compiled inside a scope sees the scope's $_SERVER and $_REQUEST, not a lazily built SAPI copy
+Superglobals: with auto_globals_jit=0, a file compiled inside a scope sees the scope's $_SERVER and $_REQUEST (a copy of the creator's), not a lazily built SAPI copy
 --EXTENSIONS--
 scope
 --INI--
@@ -20,6 +20,6 @@ echo json_encode(include __DIR__ . '/auto_globals_jit.inc'), "\n";
 $s->run(function () { echo json_encode(include __DIR__ . '/auto_globals_jit.inc'), "\n"; });
 ?>
 --EXPECT--
-["scope","scope","-"]
+["env","scope","-"]
 ["env","-","-"]
-["scope","scope","-"]
+["env","scope","-"]
