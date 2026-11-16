@@ -1,5 +1,5 @@
 --TEST--
-Superglobals: $_ENV is not in scope; $_SESSION is (a new scope starts with a copy of its creator's)
+Superglobals: $_ENV is not in scope; $_SESSION is (a new scope has none, as a new request)
 --EXTENSIONS--
 scope
 session
@@ -14,6 +14,6 @@ $s->run(function () {
 echo $_ENV["E"], " ", $_SESSION["s"], "\n";
 $s->run(function () { echo $_SESSION["s"], "\n"; });
 --EXPECT--
-root set
+root unset
 child root
 child

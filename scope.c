@@ -187,7 +187,7 @@ ZEND_BEGIN_MODULE_GLOBALS(scope)
 	const ps_module *sess_real; /* while session_start() runs through a lock check: the real save handler */
 	scope_tl root_tl;       /* the root scope's timezone and locale while another scope is applied */
 	zend_ini_entry *loc_ini; /* intl.default_locale; NULL when intl is not loaded */
-	zend_string *loc_initial; /* the locale an unset intl.default_locale stands for: ICU's default at RINIT */
+	zend_string *loc_initial; /* the locale a new scope starts with: the ini value, or ICU's default at RINIT if unset */
 	zval root_sg[SCOPE_SG_N]; /* the root scope's request superglobals while another scope is applied */
 	char *root_state;       /* the globals' own state while a scope's is applied */
 	bool active;            /* between RINIT and RSHUTDOWN */
@@ -391,22 +391,18 @@ static zend_always_inline zval *scope_sg_live(int i)
 	return z;
 }
 
-/* A new scope's own arrays: a copy of the live ones, the creator's (PHP's array copy: a
- * refcount, until one side writes), and UNDEF where the creator has unset one. The live entries
- * are looked up for every one, so the first scope creation forces the lazily created
- * auto-globals (a later JIT callback would otherwise overwrite a scope's array). */
+/* A new scope's own arrays: empty, as a server's request starts before it seeds them. An
+ * empty array is stored as the engine's shared immutable one, so a switch between two scopes
+ * that both leave a superglobal empty has nothing to move for it. The live entries are looked
+ * up anyway, so the first scope creation forces the lazily created auto-globals (a later JIT
+ * callback would otherwise overwrite a scope's array). */
 static zval *scope_sg_new(void)
 {
 	zval *sg = ecalloc(SCOPE_SG_N, sizeof(zval));
 
 	for (int i = 0; i < SCOPE_SG_N; i++) {
-		zval *live = scope_sg_live(i);
-
-		if (live != NULL && !Z_ISUNDEF_P(live)) {
-			ZVAL_COPY_DEREF(&sg[i], live);
-		} else {
-			ZVAL_UNDEF(&sg[i]);
-		}
+		scope_sg_live(i);
+		ZVAL_EMPTY_ARRAY(&sg[i]);
 	}
 	return sg;
 }
@@ -461,10 +457,8 @@ void scope_sg_swap(zval *from, zval *to)
 				ZVAL_UNDEF(&to[i]);
 				continue;
 			}
-			/* the value and its type flags, not the whole zval: a bucket's zval carries the hash
-			 * chain's next link in u2, which belongs to the symbol table and not to the value */
-			ZVAL_COPY_VALUE(&from[i], live);
-			ZVAL_COPY_VALUE(live, &to[i]);   /* type flags and all: the shared empty array is not refcounted */
+			from[i] = *live;
+			*live = to[i];   /* type flags and all: the shared empty array is not refcounted */
 			ZVAL_UNDEF(&to[i]);
 			if (scope_sg_track[i] >= 0) {
 				zval *pg = &PG(http_globals)[scope_sg_track[i]];
@@ -594,15 +588,18 @@ static void scope_tl_save(scope_tl *t)
 	t->ready = true;
 }
 
-/* A new scope starts with its creator's values: the live ones. A creator that never set a
- * timezone has none (NULL), so the copy keeps following the date.timezone ini. */
+/* A new scope starts with the ini values: no timezone of its own (the date.timezone ini,
+ * or its fallback) and the ini value of intl.default_locale, not its creator's. */
 static void scope_tl_init(scope_tl *t)
 {
 	memset(t, 0, sizeof(*t));
-	scope_tl_save(t);
+	if (SCOPE_G(loc_initial)) {
+		t->loc = zend_string_copy(SCOPE_G(loc_initial));
+	}
+	t->ready = true;
 }
 
-/* RINIT: the locale an unset intl.default_locale stands for. It means ICU's process
+/* RINIT: the locale a new scope starts with. intl.default_locale unset means ICU's process
  * default, which Locale::setDefault() also changes; take its value before any code runs. */
 static void scope_tl_startup(void)
 {
@@ -701,22 +698,26 @@ static php_ps_globals *scope_ps;
 	X(define_sid, define_sid) X(in_save_handler, in_save_handler) X(set_handler, set_handler) \
 	SCOPE_SESS_STARTED(X)
 
-/* The session a scope holds a copy of, while it is active: the copy has the opener's id, status
- * and $_SESSION but not its open handler (mod_data), so reading it again, and locking it, is the
- * opener's alone. ext/session writes through PS(mod), which for an active copy is the proxy
- * below: a write or destroy goes through the opener's open handler when the opener still holds
- * the session, and through a handler opened for the occasion when it does not, and close does
- * nothing but put the real module back. A copy destroyed while active is dropped, not written. */
-typedef struct {
-	ps_module proxy;   /* first: what PS(mod) points to */
-	const ps_module *real;
-} scope_copy;
-
-static zend_result scope_copy_open(PS_OPEN_ARGS);
-
-static zend_always_inline bool scope_is_copy_mod(const ps_module *m)
+/* A new scope's session state: none started, the save handler of the session.save_handler ini. */
+static scope_sess *scope_sess_new(void)
 {
-	return m != NULL && m->s_open == scope_copy_open;
+	scope_sess *ss = ecalloc(1, sizeof(scope_sess));
+	zend_ini_entry *h = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("session.save_handler"));
+	zend_string *hv = h ? h->value : NULL;   /* the request's current setting: ini_set() of it is request-wide */
+
+	/* the live module when it is that handler: an extension may have put its own copy of the
+	 * module in place (ext-phasync's cooperative "files"), and a new scope keeps it */
+	if (hv && scope_ps->mod && strcmp(scope_ps->mod->s_name, ZSTR_VAL(hv)) == 0) {
+		ss->mod = scope_ps->mod;
+	} else {
+		ss->mod = hv ? _php_find_ps_module(ZSTR_VAL(hv)) : NULL;
+	}
+	ss->status = ss->mod ? php_session_none : php_session_disabled;
+	ss->define_sid = true;
+	ZVAL_UNDEF(&ss->http_vars);
+	ZVAL_UNDEF(&ss->sym);   /* a new request has no $_SESSION until session_start() */
+	ss->pristine = true;
+	return ss;
 }
 
 /* Release what a stored (not applied) session state owns; its session is already closed. */
@@ -724,7 +725,6 @@ static void scope_sess_free(scope_sess *ss)
 {
 	zval *names = (zval *) &ss->user_names;
 
-	if (scope_is_copy_mod(ss->mod) && ss->mod_data) efree(ss->mod_data);   /* an active copy's proxy */
 	if (ss->id) zend_string_release(ss->id);
 	if (ss->vars) zend_string_release(ss->vars);
 	if (ss->user_class_name) zend_string_release(ss->user_class_name);
@@ -770,171 +770,6 @@ static zend_always_inline bool scope_sess_live_pristine(void)
 		}
 	}
 	return true;
-}
-
-#if PHP_VERSION_ID >= 80500
-# define SCOPE_PS_STR(x) ZSTR_VAL(x)
-#else
-# define SCOPE_PS_STR(x) (x)
-#endif
-
-/* The opener of the active session the copy in the live globals holds: the scope, not a copy,
- * that is active under the same id and module. The copy is the applied scope, so the others
- * (the root's included) are in storage. */
-static scope_sess *scope_copy_opener(const ps_module *real)
-{
-	zend_object *obj;
-	scope_sess *ss = &SCOPE_G(root_sess);
-
-	if (SCOPE_G(applied) != NULL && ss->status == php_session_active && ss->mod == real
-		&& ss->id && scope_ps->id && zend_string_equals(ss->id, scope_ps->id)) {
-		return ss;
-	}
-	ZEND_HASH_FOREACH_PTR(&SCOPE_G(sess_scopes), obj) {
-		ss = SCOPE_OBJECT(obj)->sess;
-		if (obj != SCOPE_G(applied) && ss && ss->status == php_session_active && ss->mod == real
-			&& ss->id && scope_ps->id && zend_string_equals(ss->id, scope_ps->id)) {
-			return ss;
-		}
-	} ZEND_HASH_FOREACH_END();
-	return NULL;
-}
-
-/* Run an operation of the real module for the active copy: on the opener's handle, or on one
- * opened just for it. */
-#define SCOPE_COPY_FORWARD(call) \
-	const ps_module *real = ((scope_copy *) scope_ps->mod)->real; \
-	scope_sess *o = scope_copy_opener(real); \
-	if (o) { \
-		void **mod_data = &o->mod_data; \
-		return call; \
-	} else { \
-		void *own = NULL, **mod_data = &own; \
-		if (real->s_open(&own, SCOPE_PS_STR(scope_ps->save_path), SCOPE_PS_STR(scope_ps->session_name)) != SUCCESS) { \
-			return FAILURE; \
-		} \
-		__typeof__(call) r = call; \
-		real->s_close(&own); \
-		return r; \
-	}
-
-static zend_result scope_copy_open(PS_OPEN_ARGS)
-{
-	return FAILURE;   /* never reached for a live copy: it is open already */
-}
-
-static zend_result scope_copy_close(PS_CLOSE_ARGS)
-{
-	scope_copy *c = *mod_data;
-
-	if (scope_ps->mod == &c->proxy) {
-		scope_ps->mod = c->real;
-	}
-	scope_ps->mod_user_is_open = false;   /* the opener's close callback is not this scope's to call */
-	*mod_data = NULL;
-	efree(c);
-	return SUCCESS;
-}
-
-static zend_result scope_copy_read(PS_READ_ARGS)
-{
-	return FAILURE;
-}
-
-static zend_result scope_copy_write(PS_WRITE_ARGS)
-{
-	SCOPE_COPY_FORWARD(real->s_write(mod_data, key, val, maxlifetime))
-}
-
-static zend_result scope_copy_destroy(PS_DESTROY_ARGS)
-{
-	SCOPE_COPY_FORWARD(real->s_destroy(mod_data, key))
-}
-
-static zend_long scope_copy_gc(PS_GC_ARGS)
-{
-	const ps_module *real = ((scope_copy *) scope_ps->mod)->real;
-	scope_sess *o = scope_copy_opener(real);
-
-	return o ? real->s_gc(&o->mod_data, maxlifetime, nrdels) : -1;
-}
-
-/* A new scope's session: a copy of the live one, the creator's. */
-static scope_sess *scope_sess_new(void)
-{
-	php_ps_globals *p = scope_ps;
-	scope_sess *ss = ecalloc(1, sizeof(scope_sess));
-	zval *sym = scope_symbol(SCOPE_SYM_SESSION);
-	zval *names = (zval *) &ss->user_names, *live_names = (zval *) &p->mod_user_names;
-	bool pristine = scope_sess_live_pristine();
-
-	if (sym && Z_TYPE_P(sym) == IS_INDIRECT) {
-		sym = Z_INDIRECT_P(sym);
-	}
-	if (sym && Z_ISUNDEF_P(sym)) {
-		sym = NULL;
-	}
-	if (p->id) ss->id = zend_string_copy(p->id);
-	if (p->session_vars) ss->vars = zend_string_copy(p->session_vars);
-	if (p->mod_user_class_name) ss->user_class_name = zend_string_copy(p->mod_user_class_name);
-#if PHP_VERSION_ID >= 80300
-	if (p->session_started_filename) ss->started_file = zend_string_copy(p->session_started_filename);
-	ss->started_line = p->session_started_lineno;
-#endif
-#if PHP_VERSION_ID >= 80600
-	ss->user_obj_methods = p->mod_user_uses_object_methods_as_handlers;
-#endif
-	for (size_t i = 0; i < sizeof(ss->user_names) / sizeof(zval); i++) {
-		ZVAL_COPY(&names[i], &live_names[i]);
-	}
-	ss->status = p->session_status;
-	ss->mod = p->mod;
-	ss->user_implemented = p->mod_user_implemented;
-	ss->user_is_open = p->mod_user_is_open;
-	ss->send_cookie = p->send_cookie;
-	ss->define_sid = p->define_sid;
-	ss->set_handler = p->set_handler;
-	if (p->session_status == php_session_active && p->mod) {
-		scope_copy *c = emalloc(sizeof(scope_copy));
-
-		c->real = scope_is_copy_mod(p->mod) ? ((scope_copy *) p->mod)->real : p->mod;
-		c->proxy = *c->real;
-		c->proxy.s_open = scope_copy_open;
-		c->proxy.s_close = scope_copy_close;
-		c->proxy.s_read = scope_copy_read;
-		c->proxy.s_write = scope_copy_write;
-		c->proxy.s_destroy = scope_copy_destroy;
-		c->proxy.s_gc = scope_copy_gc;
-		c->proxy.s_create_sid = php_session_create_id;
-		c->proxy.s_validate_sid = php_session_validate_sid;
-		c->proxy.s_update_timestamp = NULL;   /* every write is a write */
-		ss->mod = &c->proxy;
-		ss->mod_data = c;
-	}
-	/* $_SESSION and the array the session writes from are one reference, as session_start() made them */
-	if (!Z_ISUNDEF(p->http_session_vars)) {
-		zval *src = &p->http_session_vars, arr;
-
-		ZVAL_DEREF(src);
-		ZVAL_COPY(&arr, src);
-		ZVAL_NEW_REF(&ss->http_vars, &arr);
-		if (sym && Z_ISREF(p->http_session_vars) && Z_ISREF_P(sym) && Z_REF_P(sym) == Z_REF(p->http_session_vars)) {
-			ZVAL_COPY(&ss->sym, &ss->http_vars);
-		} else if (sym) {
-			ZVAL_COPY_DEREF(&ss->sym, sym);
-		} else {
-			ZVAL_UNDEF(&ss->sym);
-		}
-	} else {
-		ZVAL_UNDEF(&ss->http_vars);
-		if (sym) {
-			ZVAL_COPY_DEREF(&ss->sym, sym);
-		} else {
-			ZVAL_UNDEF(&ss->sym);
-		}
-	}
-	ss->pristine = pristine && sym == NULL;
-	return ss;
 }
 
 void scope_sess_swap(scope_sess *from, scope_sess *to)
@@ -1039,7 +874,7 @@ static bool scope_sess_locks(const ps_module *mod, zval *names)
 
 static bool scope_sess_held(scope_sess *ss, zend_string *key)
 {
-	return ss->status == php_session_active && !scope_is_copy_mod(ss->mod) && ss->id && zend_string_equals(ss->id, key)
+	return ss->status == php_session_active && ss->id && zend_string_equals(ss->id, key)
 		&& scope_sess_locks(ss->mod, (zval *) &ss->user_names);
 }
 
@@ -1080,7 +915,7 @@ static ZEND_NAMED_FUNCTION(scope_session_start)
 	const ps_module *mod = scope_ps ? scope_ps->mod : NULL;
 	ps_module proxy;
 
-	if (!SCOPE_SESS_ON() || !SCOPE_G(active) || Z_ISUNDEF(SCOPE_G(members)) || scope_is_copy_mod(mod)
+	if (!SCOPE_SESS_ON() || !SCOPE_G(active) || Z_ISUNDEF(SCOPE_G(members))
 		|| !scope_sess_locks(mod, (zval *) &scope_ps->mod_user_names)) {
 		scope_orig_session_start(INTERNAL_FUNCTION_PARAM_PASSTHRU);   /* no other scope exists, or no lock */
 		return;
@@ -1096,31 +931,12 @@ static ZEND_NAMED_FUNCTION(scope_session_start)
 	SCOPE_G(sess_real) = NULL;
 }
 
-static zif_handler scope_orig_session_regenerate_id;
-
-/* A copy of an active session closes and reopens the handler to change the id, and the reopen
- * would wait for the lock the opener holds. */
-static ZEND_NAMED_FUNCTION(scope_session_regenerate_id)
-{
-	if (scope_ps && scope_is_copy_mod(scope_ps->mod)) {
-		zend_throw_exception(spl_ce_RuntimeException,
-			"session_regenerate_id(): the session was opened in another scope of this process, and this "
-			"scope only holds a copy of it", 0);
-		return;
-	}
-	scope_orig_session_regenerate_id(INTERNAL_FUNCTION_PARAM_PASSTHRU);
-}
-
 /* The end of a scope's session, as ext/session's RSHUTDOWN ends a request's: write and close
  * an active session, then free the state. The scope must not be the applied one. */
 static void scope_sess_end(scope_sess *ss)
 {
 	scope_sess live = {0};
 
-	if (scope_is_copy_mod(ss->mod)) {
-		scope_sess_free(ss);   /* an active copy is dropped: the opener's handle and lock are not its to close */
-		return;
-	}
 	if (ss->status == php_session_active || ss->mod_data || ss->user_implemented) {
 		scope_sess_swap(&live, ss);
 		if (scope_ps->session_status == php_session_active) {
@@ -2406,11 +2222,6 @@ static PHP_MINIT_FUNCTION(scope)
 		if (f && f->type == ZEND_INTERNAL_FUNCTION) {
 			scope_orig_session_start = f->internal_function.handler;
 			f->internal_function.handler = scope_session_start;
-		}
-		f = zend_hash_str_find_ptr(CG(function_table), ZEND_STRL("session_regenerate_id"));
-		if (f && f->type == ZEND_INTERNAL_FUNCTION) {
-			scope_orig_session_regenerate_id = f->internal_function.handler;
-			f->internal_function.handler = scope_session_regenerate_id;
 		}
 	}
 	scope_ce = register_class_Scope();

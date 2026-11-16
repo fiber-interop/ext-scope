@@ -7,7 +7,7 @@ scope
 $_GET = ["root" => 1];
 $s = new Scope();
 $s->run(function () {
-    echo json_encode($_GET), "\n";   // a copy of the root's
+    echo json_encode($_GET), "\n";   // empty: a new scope starts empty
     $a = new Fiber(function () { $g = &$_GET; $g['t'] = 1; Fiber::suspend(); $g['u'] = 2; });
     $b = new Fiber(function () { echo json_encode($_GET), "\n"; Fiber::suspend(); echo json_encode($_GET), "\n"; });
     $a->start(); $b->start();
@@ -15,7 +15,7 @@ $s->run(function () {
 });
 echo json_encode($_GET), "|", json_encode($s->run(fn() => $_GET)), "\n";
 --EXPECT--
-{"root":1}
-{"root":1,"t":1}
-{"root":1,"t":1,"u":2}
-{"root":1}|{"root":1,"t":1,"u":2}
+[]
+{"t":1}
+{"t":1,"u":2}
+{"root":1}|{"t":1,"u":2}

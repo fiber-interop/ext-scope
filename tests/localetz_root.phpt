@@ -1,5 +1,5 @@
 --TEST--
-Locale/timezone: the root scope's values are today's; a scope starts with a copy of them and its change never leaks to the root
+Locale/timezone: the root scope's values are today's (ini); a scope's change never leaks to the root
 --EXTENSIONS--
 scope
 --INI--
@@ -13,5 +13,5 @@ $s->run(function () { echo date_default_timezone_get(), "\n"; date_default_timez
 echo date_default_timezone_get(), "\n";
 --EXPECT--
 Europe/Oslo
-Asia/Tokyo
+Europe/Oslo
 Asia/Tokyo
