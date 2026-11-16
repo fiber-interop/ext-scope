@@ -1,5 +1,5 @@
 --TEST--
-Locale/timezone: a new scope starts with its creator's timezone and locale as they are when it is constructed
+Locale/timezone: a new scope starts with the ini timezone and locale even after its creator changed them
 --EXTENSIONS--
 scope
 intl
@@ -19,7 +19,7 @@ $a->run(function () {
 });
 echo date_default_timezone_get(), " ", Locale::getDefault(), "\n";
 --EXPECT--
-Asia/Tokyo de_DE
-America/Chicago fr_FR
+Europe/Oslo nb_NO
+Europe/Oslo nb_NO
 America/Chicago fr_FR
 Asia/Tokyo de_DE
