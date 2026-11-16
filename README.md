@@ -41,6 +41,13 @@ The root scope is one object for the whole request (process, on the CLI). It is 
 `Scope::getCurrent() !== Scope::getRootScope()`. To start something that belongs to no request
 from inside one: `Scope::getRootScope()->run(fn() => /* start the service */)`.
 
+## Release 0.6.1
+
+Fixes a hang on PHP 8.2 to 8.4: `unset()` of a request superglobal inside a scope, with `$_REQUEST` also set,
+corrupted the global symbol table's hash chain, and the next lookup looped forever. The swap copied the whole
+bucket `zval`, including the chain link PHP keeps in it, instead of only the value. A new scope still starts empty,
+as in 0.6.0.
+
 ## Release 0.6.0
 
 0.6.0 implements the fiber rule of the Scope RFC 0.10: every stack frame gets its scope when it is created, and

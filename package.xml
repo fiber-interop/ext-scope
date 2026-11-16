@@ -10,9 +10,9 @@
   <email>frode@ennerd.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-29</date>
+ <date>2026-11-16</date>
  <version>
-  <release>0.6.0</release>
+  <release>0.6.1</release>
   <api>0.6.0</api>
  </version>
  <stability>
@@ -20,7 +20,7 @@
   <api>alpha</api>
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
- <notes>0.6.0: the fiber rule of the Scope RFC 0.10. Fiber::start() is an ordinary call: a fiber runs in the scope current where start() is called, and constructing a fiber captures nothing. A started fiber keeps its scope across suspensions, whoever resumes it; new Fiber($scope->bind($fn)) runs in $scope whoever starts it. A finished fiber no longer keeps its scope alive. Fiber::getScope() is removed; Generator::getScope() and generators are unchanged.</notes>
+ <notes>0.6.1: fixes a hang on PHP 8.2-8.4 when a scope unsets a request superglobal while $_REQUEST is set: the swap copied the symbol table bucket's hash-chain link along with the value. A new scope still starts empty.</notes>
  <contents>
   <dir name="/">
    <file name="config.m4" role="src"/>
@@ -92,6 +92,7 @@
     <file name="run_without.phpt" role="test"/>
     <file name="superglobal_reference_switch.phpt" role="test"/>
     <file name="superglobal_bucket_reused.phpt" role="test"/>
+    <file name="superglobal_unset_bucket_chain.phpt" role="test"/>
    </dir>
   </dir>
  </contents>

@@ -47,7 +47,7 @@
 ZEND_TSRMLS_CACHE_EXTERN()
 #endif
 
-#define PHP_SCOPE_VERSION "0.6.0"
+#define PHP_SCOPE_VERSION "0.6.1"
 
 #define SCOPE_MEMBER  0
 #define SCOPE_CURRENT 1
@@ -457,8 +457,10 @@ void scope_sg_swap(zval *from, zval *to)
 				ZVAL_UNDEF(&to[i]);
 				continue;
 			}
-			from[i] = *live;
-			*live = to[i];   /* type flags and all: the shared empty array is not refcounted */
+			/* the value and its type flags, not the whole zval: a bucket's zval carries the hash
+			 * chain's next link in u2, which belongs to the symbol table and not to the value */
+			ZVAL_COPY_VALUE(&from[i], live);
+			ZVAL_COPY_VALUE(live, &to[i]);   /* type flags and all: the shared empty array is not refcounted */
 			ZVAL_UNDEF(&to[i]);
 			if (scope_sg_track[i] >= 0) {
 				zval *pg = &PG(http_globals)[scope_sg_track[i]];
